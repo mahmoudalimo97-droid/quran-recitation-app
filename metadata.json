@@ -1,0 +1,6 @@
+{
+  "name": "مُسمِّع - تسميع القرآن الكريم بالصوت",
+  "description": "تطبيق بسيط ومباشر لتسميع القرآن الكريم بالصوت آية بآية مع فهرس كامل لجميع السور وكتابة الكلمات فوراً بخلفية سادة هادئة.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
