@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { Capacitor } from '@capacitor/core';
+import { SpeechRecognition as NativeSpeechRecognition } from '@capacitor-community/speech-recognition';
 
 interface SpeechRecognitionHookOptions {
   onTranscript?: (transcript: string, isFinal: boolean) => void;
@@ -15,16 +17,26 @@ export function useSpeechRecognition({
   const [isSupported, setIsSupported] = useState(true);
   const [audioLevel, setAudioLevel] = useState(0);
 
+  // Web Speech API refs
   const recognitionRef = useRef<any>(null);
   const shouldListenRef = useRef(false);
+  const resultOffsetRef = useRef<number>(0);
+  const latestResultCountRef = useRef<number>(0);
+
+  // Native plugin refs
+  const isNative = Capacitor.isNativePlatform();
+  const listenersAttachedRef = useRef(false);
+  const baseUtteranceRef = useRef<string>('');
+  const lastSeenUtteranceRef = useRef<string>('');
+  const simulatedLevelIntervalRef = useRef<number | null>(null);
+
+  // Audio visualizer refs
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const animFrameRef = useRef<number | null>(null);
-  const resultOffsetRef = useRef<number>(0);
-  const latestResultCountRef = useRef<number>(0);
 
-  // Keep fresh reference to onTranscript to avoid stale closure
+  // Fresh callback reference
   const onTranscriptRef = useRef(onTranscript);
   useEffect(() => {
     onTranscriptRef.current = onTranscript;
@@ -32,29 +44,59 @@ export function useSpeechRecognition({
 
   // Check support on mount
   useEffect(() => {
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      setIsSupported(false);
+    if (Capacitor.isNativePlatform()) {
+      NativeSpeechRecognition.available()
+        .then((res) => {
+          setIsSupported(res.available);
+        })
+        .catch(() => {
+          // Assume supported on native Android by default
+          setIsSupported(true);
+        });
+    } else {
+      const WebSpeech =
+        (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (!WebSpeech) {
+        setIsSupported(false);
+      }
     }
   }, []);
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      shouldListenRef.current = false;
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch (_) {}
-      }
-      stopAudioVisualizer();
-    };
+  const stopAudioVisualizer = useCallback(() => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (simulatedLevelIntervalRef.current) {
+      clearInterval(simulatedLevelIntervalRef.current);
+      simulatedLevelIntervalRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close();
+      } catch (_) {}
+      audioContextRef.current = null;
+    }
+    setAudioLevel(0);
   }, []);
 
   const startAudioVisualizer = useCallback(async () => {
     try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        // Fallback pulsing visualizer for native platforms if Web Audio is restricted
+        if (isNative) {
+          if (simulatedLevelIntervalRef.current) clearInterval(simulatedLevelIntervalRef.current);
+          simulatedLevelIntervalRef.current = window.setInterval(() => {
+            setAudioLevel(Math.floor(25 + Math.random() * 45));
+          }, 150);
+        }
+        return;
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
@@ -88,36 +130,146 @@ export function useSpeechRecognition({
 
       updateLevel();
     } catch (e) {
-      console.warn('Audio visualizer init error:', e);
+      console.warn('Audio visualizer fallback to simulated level:', e);
+      if (simulatedLevelIntervalRef.current) clearInterval(simulatedLevelIntervalRef.current);
+      simulatedLevelIntervalRef.current = window.setInterval(() => {
+        setAudioLevel(Math.floor(20 + Math.random() * 40));
+      }, 150);
     }
-  }, []);
+  }, [isNative]);
 
-  const stopAudioVisualizer = useCallback(() => {
-    if (animFrameRef.current) {
-      cancelAnimationFrame(animFrameRef.current);
-      animFrameRef.current = null;
-    }
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-      mediaStreamRef.current = null;
-    }
-    if (audioContextRef.current) {
-      try {
-        audioContextRef.current.close();
-      } catch (_) {}
-      audioContextRef.current = null;
-    }
-    setAudioLevel(0);
-  }, []);
+  // Clean up on unmount
+  useEffect(() => {
+    return () => {
+      shouldListenRef.current = false;
+      if (isNative) {
+        NativeSpeechRecognition.stop().catch(() => {});
+        NativeSpeechRecognition.removeAllListeners().catch(() => {});
+      } else if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch (_) {}
+      }
+      stopAudioVisualizer();
+    };
+  }, [isNative, stopAudioVisualizer]);
 
-  const startListening = useCallback(() => {
+  // Start Native Listening using @capacitor-community/speech-recognition
+  const startNativeListening = useCallback(async () => {
+    setError(null);
+    try {
+      // 1. Check & Request Permissions
+      const permStatus = await NativeSpeechRecognition.checkPermissions();
+      if (permStatus.speechRecognition !== 'granted') {
+        const reqResult = await NativeSpeechRecognition.requestPermissions();
+        if (reqResult.speechRecognition !== 'granted') {
+          setError('لم يتم منح إذن الميكروفون. يرجى السماح للتطبيق بالوصول إلى الميكروفون من إعدادات الهاتف لتتمكن من التسميع.');
+          setIsListening(false);
+          shouldListenRef.current = false;
+          return;
+        }
+      }
+
+      // 2. Check Service Availability
+      const avail = await NativeSpeechRecognition.available();
+      if (!avail.available) {
+        setError('خدمة التعرف الصوتي غير متوفرة على هذا الجهاز. يرجى التحقق من تثبيت تطبيق خدمات Google وتفعيله.');
+        setIsListening(false);
+        shouldListenRef.current = false;
+        return;
+      }
+
+      shouldListenRef.current = true;
+      baseUtteranceRef.current = '';
+      lastSeenUtteranceRef.current = '';
+
+      // 3. Register Event Listeners if not already attached
+      if (!listenersAttachedRef.current) {
+        await NativeSpeechRecognition.removeAllListeners();
+
+        await NativeSpeechRecognition.addListener('partialResults', (data: { matches: string[] }) => {
+          if (!shouldListenRef.current) return;
+          const matches = data.matches || [];
+          const bestMatch = matches[0] || '';
+          if (!bestMatch) return;
+
+          lastSeenUtteranceRef.current = bestMatch;
+
+          // Strip baseline if clearSession occurred within same recognition burst
+          let effectiveText = bestMatch;
+          if (baseUtteranceRef.current && effectiveText.startsWith(baseUtteranceRef.current)) {
+            effectiveText = effectiveText.slice(baseUtteranceRef.current.length).trim();
+          }
+
+          setInterimTranscript(effectiveText);
+          if (effectiveText && onTranscriptRef.current) {
+            onTranscriptRef.current(effectiveText, false);
+          }
+        });
+
+        await NativeSpeechRecognition.addListener('listeningState', (data: { status: 'started' | 'stopped' }) => {
+          if (data.status === 'started') {
+            setIsListening(true);
+            setError(null);
+          } else if (data.status === 'stopped') {
+            // Auto restart if listening was not manually stopped
+            if (shouldListenRef.current) {
+              setTimeout(async () => {
+                if (shouldListenRef.current) {
+                  try {
+                    baseUtteranceRef.current = '';
+                    lastSeenUtteranceRef.current = '';
+                    await NativeSpeechRecognition.start({
+                      language: lang,
+                      maxResults: 3,
+                      prompt: 'اقرأ الآن',
+                      partialResults: true,
+                      popup: false,
+                    });
+                  } catch (err) {
+                    console.warn('Native auto-restart notice:', err);
+                  }
+                }
+              }, 200);
+            } else {
+              setIsListening(false);
+              stopAudioVisualizer();
+            }
+          }
+        });
+
+        listenersAttachedRef.current = true;
+      }
+
+      // 4. Start Recognition
+      await NativeSpeechRecognition.start({
+        language: lang,
+        maxResults: 3,
+        prompt: 'اقرأ الآن',
+        partialResults: true,
+        popup: false,
+      });
+
+      setIsListening(true);
+      startAudioVisualizer();
+    } catch (err: any) {
+      console.error('Failed to start native speech recognition:', err);
+      setError('حدث خطأ أثناء تشغيل الميكروفون. يرجى إعادة المحاولة.');
+      setIsListening(false);
+      shouldListenRef.current = false;
+      stopAudioVisualizer();
+    }
+  }, [lang, startAudioVisualizer, stopAudioVisualizer]);
+
+  // Start Web Listening using Web Speech API
+  const startWebListening = useCallback(() => {
     setError(null);
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
       setIsSupported(false);
-      setError('المتصفح الحالي لا يدعم التعرف على الصوت عبر Web Speech API. يمكنك استخدام وضع المحاكاة للتسميع.');
+      setError('المتصفح الحالي لا يدعم التعرف على الصوت عبر Web Speech API.');
       return;
     }
 
@@ -198,7 +350,6 @@ export function useSpeechRecognition({
         resultOffsetRef.current = 0;
         latestResultCountRef.current = 0;
 
-        // Automatically restart if user hasn't explicitly clicked stop
         if (shouldListenRef.current) {
           try {
             recognition.start();
@@ -221,25 +372,41 @@ export function useSpeechRecognition({
 
       recognition.start();
     } catch (err: any) {
-      console.error('Failed to start speech recognition:', err);
+      console.error('Failed to start web speech recognition:', err);
       setError('تعذر تشغيل التعرف على الصوت. تحقق من توصيل الميكروفون.');
       setIsListening(false);
       stopAudioVisualizer();
     }
   }, [lang, startAudioVisualizer, stopAudioVisualizer]);
 
+  // Unified startListening entry point
+  const startListening = useCallback(() => {
+    if (Capacitor.isNativePlatform()) {
+      startNativeListening();
+    } else {
+      startWebListening();
+    }
+  }, [startNativeListening, startWebListening]);
+
+  // Unified stopListening
   const stopListening = useCallback(() => {
     shouldListenRef.current = false;
     setIsListening(false);
     setInterimTranscript('');
-    resultOffsetRef.current = 0;
-    latestResultCountRef.current = 0;
     stopAudioVisualizer();
 
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (_) {}
+    if (Capacitor.isNativePlatform()) {
+      baseUtteranceRef.current = '';
+      lastSeenUtteranceRef.current = '';
+      NativeSpeechRecognition.stop().catch(() => {});
+    } else {
+      resultOffsetRef.current = 0;
+      latestResultCountRef.current = 0;
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch (_) {}
+      }
     }
   }, [stopAudioVisualizer]);
 
@@ -247,10 +414,14 @@ export function useSpeechRecognition({
     setInterimTranscript('');
   }, []);
 
-  // Seamlessly slides result offset between ayahs without stopping/aborting audio hardware
+  // Seamlessly transitions between Ayahs without resetting audio hardware
   const clearSession = useCallback(() => {
     setInterimTranscript('');
-    resultOffsetRef.current = latestResultCountRef.current;
+    if (Capacitor.isNativePlatform()) {
+      baseUtteranceRef.current = lastSeenUtteranceRef.current;
+    } else {
+      resultOffsetRef.current = latestResultCountRef.current;
+    }
   }, []);
 
   return {
