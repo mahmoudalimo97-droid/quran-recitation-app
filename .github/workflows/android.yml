@@ -2,64 +2,70 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
-  build-apk:
-    name: Build Android APK
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
+          cache: npm
 
-      - name: Setup Java 17
+      - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: 17
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+          distribution: temurin
+          java-version: 21
 
       - name: Install dependencies
+        run: npm install
+
+      - name: Generate Android icons and splash assets
         run: |
-          if [ -f "package-lock.json" ]; then
-            npm ci || npm install --legacy-peer-deps
-          else
-            npm install --legacy-peer-deps
-          fi
+          npx @capacitor/assets generate --android || npx capacitor-assets generate --android || true
 
       - name: Build web application
         run: npm run build
 
-      - name: Sync Capacitor Android
+      - name: Add Android platform if missing
         run: |
           if [ ! -d "android" ]; then
             npx cap add android
           fi
-          npx cap sync android
 
-      - name: Ensure gradlew is executable
-        run: chmod +x android/gradlew
-
-      - name: Build Debug APK with Gradle
+      - name: Configure Android permissions
         run: |
-          cd android
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            if ! grep -q "android.permission.RECORD_AUDIO" "$MANIFEST"; then
+              sed -i '/<\/application>/a \    <uses-permission android:name="android.permission.RECORD_AUDIO" />' "$MANIFEST"
+            fi
+            if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+              sed -i '/<\/application>/a \    <uses-permission android:name="android.permission.INTERNET" />' "$MANIFEST"
+            fi
+            if ! grep -q "android.permission.MODIFY_AUDIO_SETTINGS" "$MANIFEST"; then
+              sed -i '/<\/application>/a \    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />' "$MANIFEST"
+            fi
+          fi
+
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+
+      - name: Build APK with Gradle
+        working-directory: android
+        run: |
+          chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
 
-      - name: Upload APK Artifact
+      - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: musammi-app-debug-apk
+          name: app-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

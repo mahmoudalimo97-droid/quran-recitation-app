@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">مُسمِّع</string>
-    <string name="title_activity_main">مُسمِّع</string>
-    <string name="package_name">com.musammi.app</string>
-    <string name="custom_url_scheme">com.musammi.app</string>
+    <string name="app_name">مُسمّع</string>
+    <string name="title_activity_main">مُسمّع</string>
+    <string name="package_name">com.musamma.app</string>
+    <string name="custom_url_scheme">com.musamma.app</string>
 </resources>
