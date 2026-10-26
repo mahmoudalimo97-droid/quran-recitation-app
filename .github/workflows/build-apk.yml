@@ -13,35 +13,40 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 20
+          cache: npm
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 21
+          java-version: 17
 
       - name: Install dependencies
-        run: npm install --legacy-peer-deps
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || npm install --legacy-peer-deps
+          else
+            npm install --legacy-peer-deps
+          fi
 
       - name: Build web app
-        run: npx vite build
+        run: npm run build
 
-      - name: Add Android if missing
+      - name: Add Android platform (if missing)
         run: |
           if [ ! -d "android" ]; then
-            npm install @capacitor/android --legacy-peer-deps
+            npm install @capacitor/android@^7.1.0 --legacy-peer-deps
             npx cap add android
           fi
 
       - name: Sync Capacitor
         run: npx cap sync android
 
-      - name: Make gradlew executable
-        run: chmod +x android/gradlew
-
       - name: Build debug APK
         working-directory: android
-        run: ./gradlew assembleDebug --stacktrace
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
