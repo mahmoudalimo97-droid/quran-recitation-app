@@ -14,7 +14,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
 
       - uses: actions/setup-java@v4
         with:
@@ -22,12 +21,7 @@ jobs:
           java-version: 17
 
       - name: Install dependencies
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci || npm install --legacy-peer-deps
-          else
-            npm install --legacy-peer-deps
-          fi
+        run: npm install --legacy-peer-deps
 
       - name: Build web app
         run: npm run build
