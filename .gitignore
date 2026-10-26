@@ -1,9 +1,12 @@
 node_modules/
 /dist/
 /build/
+android/.gradle/
+android/app/build/
 coverage/
 .DS_Store
 *.log
 .env*
 !.env.example
 !package-lock.json
+!gradle-wrapper.jar
