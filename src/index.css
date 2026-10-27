@@ -1,9 +1,58 @@
 @import "tailwindcss";
 
+@font-face {
+  font-family: 'Amiri Quran';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/AmiriQuran-Regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Amiri';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/Amiri-Regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Cairo';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/Cairo-Regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Cairo';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/Cairo-Bold.woff2') format('woff2');
+}
+
 @layer base {
   :root {
-    --font-quran: 'Amiri Quran', 'Scheherazade New', 'Amiri', serif;
-    --font-arabic: 'Cairo', 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    --font-quran: 'Amiri Quran', 'Amiri', serif;
+    --font-arabic: 'Cairo', system-ui, -apple-system, sans-serif;
+    --safe-area-top: max(env(safe-area-inset-top, 0px), 24px);
+    --safe-area-bottom: max(env(safe-area-inset-bottom, 0px), 24px);
+  }
+
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    min-height: 100%;
+    height: 100dvh;
+    margin: 0;
+    padding: 0;
+    overflow-x: hidden;
+    overscroll-behavior: none;
+    -webkit-overflow-scrolling: touch;
+    -webkit-tap-highlight-color: transparent;
   }
 
   body {
@@ -11,6 +60,7 @@
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    user-select: none;
   }
 }
 
@@ -20,6 +70,23 @@
 
 .font-arabic {
   font-family: 'Cairo', 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+}
+
+/* Safe Area Utility Classes */
+.safe-padding-top {
+  padding-top: max(env(safe-area-inset-top, 0px), 24px);
+}
+
+.safe-padding-bottom {
+  padding-bottom: max(env(safe-area-inset-bottom, 0px), 24px);
+}
+
+.safe-margin-top {
+  margin-top: max(env(safe-area-inset-top, 0px), 24px);
+}
+
+.safe-margin-bottom {
+  margin-bottom: max(env(safe-area-inset-bottom, 0px), 24px);
 }
 
 /* Custom subtle scrollbar */

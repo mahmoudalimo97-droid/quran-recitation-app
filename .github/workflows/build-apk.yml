@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -21,7 +24,12 @@ jobs:
           java-version: 21
 
       - name: Install dependencies
-        run: npm install --legacy-peer-deps
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci || npm install --legacy-peer-deps
+          else
+            npm install --legacy-peer-deps
+          fi
 
       - name: Build web app
         run: npm run build
@@ -30,13 +38,27 @@ jobs:
         run: npx cap sync android
 
       - name: Build debug APK
+        working-directory: android
         run: |
-          cd android
-          chmod +x gradlew
+          chmod +x ./gradlew
           ./gradlew assembleDebug
 
-      - name: Upload APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: latest
+          body: "تحميل أحدث نسخة من تطبيق تسميع القرآن الكريم (app-debug.apk)"
+          draft: false
+          prerelease: false
+          make_latest: "true"
+          files: android/app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

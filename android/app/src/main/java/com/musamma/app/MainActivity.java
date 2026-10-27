@@ -1,4 +1,4 @@
-package com.musammi.app;
+package com.musamma.app;
 
 import com.getcapacitor.BridgeActivity;
 

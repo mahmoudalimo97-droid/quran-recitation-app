@@ -71,9 +71,9 @@ export const SurahIndexView: React.FC<SurahIndexViewProps> = ({
     : null;
 
   return (
-    <div className="w-full min-h-screen bg-[#faf9f5] dark:bg-[#121212] text-stone-900 dark:text-stone-100 flex flex-col font-arabic transition-colors duration-200">
+    <div className="w-full h-full min-h-[100dvh] bg-[#faf9f5] dark:bg-[#121212] text-stone-900 dark:text-stone-100 flex flex-col font-arabic transition-colors duration-200 overflow-x-hidden">
       {/* Top Simple Header */}
-      <header className="w-full max-w-5xl mx-auto px-4 sm:px-6 pt-6 pb-4 flex items-center justify-between">
+      <header className="w-full px-4 sm:px-6 pt-[max(env(safe-area-inset-top),20px)] pb-3 flex items-center justify-between sticky top-0 z-20 bg-[#faf9f5]/90 dark:bg-[#121212]/90 backdrop-blur-md border-b border-stone-200/40 dark:border-stone-800/40">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-2xl bg-amber-500/10 dark:bg-amber-400/10 border border-amber-600/20 dark:border-amber-400/20 flex items-center justify-center text-amber-700 dark:text-amber-400">
             <BookOpen className="w-5 h-5" />
@@ -91,7 +91,7 @@ export const SurahIndexView: React.FC<SurahIndexViewProps> = ({
         {/* Theme toggle */}
         <button
           onClick={onToggleDarkMode}
-          className="p-2.5 rounded-xl border border-stone-200 dark:border-stone-800 hover:bg-stone-100 dark:hover:bg-stone-800 text-stone-600 dark:text-stone-300 transition-colors shadow-xs"
+          className="p-2.5 rounded-xl border border-stone-200 dark:border-stone-800 hover:bg-stone-100 dark:hover:bg-stone-800 text-stone-600 dark:text-stone-300 transition-colors shadow-xs active:scale-95"
           title={isDarkMode ? 'الوضع النهاري' : 'الوضع الليلي'}
           aria-label="تبديل المظهر"
         >
@@ -100,7 +100,7 @@ export const SurahIndexView: React.FC<SurahIndexViewProps> = ({
       </header>
 
       {/* Main Container */}
-      <main className="w-full max-w-5xl mx-auto px-4 sm:px-6 py-4 flex-1 flex flex-col">
+      <main className="w-full px-4 sm:px-6 py-4 flex-1 flex flex-col pb-[max(env(safe-area-inset-bottom),24px)] overflow-y-auto">
         {/* Continue Last Surah Banner if available */}
         {lastSurah && (
           <div

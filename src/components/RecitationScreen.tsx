@@ -1,45 +1,27 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   ArrowRight,
-  ChevronRight,
-  ChevronLeft,
-  RotateCcw,
-  Sparkles,
   Mic,
   MicOff,
-  Sun,
-  Moon,
+  SkipForward,
+  AlertCircle,
+  RefreshCw,
   CheckCircle2,
-  HelpCircle,
-  Keyboard,
-  Send,
+  Lightbulb,
 } from 'lucide-react';
 import { QuranSurahData } from '../types/quran';
-import { formatSurahTitle } from '../utils/arabicMatcher';
+import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
+import {
+  calculateAyahMatch,
+  getFirstTwoWords,
+  normalizeArabic,
+  phoneticNormalizeArabic,
+} from '../utils/arabicMatcher';
 
 interface RecitationScreenProps {
   surahData: QuranSurahData;
-  currentAyahIndex: number;
-  revealedAyahWordCount: number;
-  isListening: boolean;
-  audioLevel: number;
-  interimTranscript: string;
-  isDarkMode: boolean;
-  fontSize: number;
-  isAyahCompletedFlash: boolean;
   onBackToIndex: () => void;
-  onToggleListening: () => void;
-  onNextAyah: () => void;
-  onPrevAyah: () => void;
-  onResetAyah: () => void;
-  onHintWord: () => void;
-  onSimulateWord: (word: string) => void;
-  onToggleDarkMode: () => void;
-  onChangeFontSize: (delta: number) => void;
-  onRestartSurah: () => void;
-  onNextSurah?: () => void;
-  hasNextSurah: boolean;
-  isSurahFinished: boolean;
+  onFinishSurah: () => void;
 }
 
 function toArabicDigits(num: number): string {
@@ -51,346 +33,570 @@ function toArabicDigits(num: number): string {
     .join('');
 }
 
+// Strips leading "بسم الله الرحمن الرحيم" if user speaks it before Ayah 1 of any surah other than Fatihah
+function stripBasmalahPrefix(spokenText: string): string {
+  const norm = normalizeArabic(spokenText);
+  const basmalahNorm = 'بسم الله الرحمن الرحيم';
+  if (norm.startsWith(basmalahNorm)) {
+    return norm.slice(basmalahNorm.length).trim();
+  }
+  const phon = phoneticNormalizeArabic(spokenText);
+  const basmalahPhon = phoneticNormalizeArabic(basmalahNorm);
+  if (phon.startsWith(basmalahPhon)) {
+    // Return approximate remainder
+    const words = spokenText.trim().split(/\s+/);
+    if (words.length > 4) {
+      return words.slice(4).join(' ');
+    }
+  }
+  return spokenText;
+}
+
 export const RecitationScreen: React.FC<RecitationScreenProps> = ({
   surahData,
-  currentAyahIndex,
-  revealedAyahWordCount,
-  isListening,
-  audioLevel,
-  interimTranscript,
-  isDarkMode,
-  fontSize,
-  isAyahCompletedFlash,
   onBackToIndex,
-  onToggleListening,
-  onNextAyah,
-  onPrevAyah,
-  onResetAyah,
-  onHintWord,
-  onSimulateWord,
-  onToggleDarkMode,
-  onChangeFontSize,
-  onRestartSurah,
-  onNextSurah,
-  hasNextSurah,
-  isSurahFinished,
+  onFinishSurah,
 }) => {
-  const [showKeyInput, setShowKeyInput] = useState(false);
-  const [typedText, setTypedText] = useState('');
-
-  const currentAyah = surahData.ayahs[currentAyahIndex];
-  const isFirstAyah = currentAyahIndex === 0;
+  const totalAyahs = surahData.numberOfAyahs || 1;
   const isSurahTawbah = surahData.number === 9;
   const isSurahFatihah = surahData.number === 1;
 
-  const totalWords = currentAyah?.words.length || 0;
-  const nextTargetWord =
-    currentAyah && revealedAyahWordCount < totalWords
-      ? currentAyah.words[revealedAyahWordCount]
-      : null;
+  // Active state
+  const [currentAyahIndex, setCurrentAyahIndex] = useState<number>(0);
+  const [liveSpokenText, setLiveSpokenText] = useState<string>('');
+  const [verseStatus, setVerseStatus] = useState<
+    'idle' | 'listening' | 'success' | 'retry'
+  >('idle');
+  const [similarity, setSimilarity] = useState<number>(0);
+  const [failedAttempts, setFailedAttempts] = useState<Record<number, number>>({});
+  const [showHint, setShowHint] = useState<boolean>(false);
+  const [isFadingOut, setIsFadingOut] = useState<boolean>(false);
+  const [showExitConfirm, setShowExitConfirm] = useState<boolean>(false);
 
-  const handleSimulateSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (typedText.trim()) {
-      onSimulateWord(typedText.trim());
-      setTypedText('');
+  // References
+  const silenceTimerRef = useRef<any>(null);
+  const retryClearTimerRef = useRef<any>(null);
+  const advanceTimerRef = useRef<any>(null);
+  const hintAutoDismissRef = useRef<any>(null);
+  const currentAyahIndexRef = useRef(currentAyahIndex);
+  const isAdvancingRef = useRef(false);
+
+  useEffect(() => {
+    currentAyahIndexRef.current = currentAyahIndex;
+    setShowHint(false);
+  }, [currentAyahIndex]);
+
+  // Target text of current Ayah
+  const currentAyah = surahData.ayahs[currentAyahIndex];
+  const targetAyahText = currentAyah?.text || '';
+  const currentFailedCount = failedAttempts[currentAyahIndex] || 0;
+  const isHintAvailable = currentFailedCount >= 3;
+  const hintText = targetAyahText ? getFirstTwoWords(targetAyahText) : '';
+
+  // Trigger advance when a verse is recited successfully
+  const triggerSuccessAdvance = useCallback(
+    (verseIndex: number) => {
+      if (isAdvancingRef.current) return;
+      isAdvancingRef.current = true;
+
+      // Clear any pending timers
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (retryClearTimerRef.current) clearTimeout(retryClearTimerRef.current);
+
+      setVerseStatus('success');
+
+      // Wait ~1000ms, then fade out and transition to the next verse with zero scroll
+      advanceTimerRef.current = setTimeout(() => {
+        setIsFadingOut(true);
+
+        setTimeout(() => {
+          const nextIdx = verseIndex + 1;
+          if (nextIdx >= totalAyahs) {
+            stopListening();
+            onFinishSurah();
+          } else {
+            clearSession();
+            setLiveSpokenText('');
+            setVerseStatus('idle');
+            setSimilarity(0);
+            isAdvancingRef.current = false;
+            setCurrentAyahIndex(nextIdx);
+            setIsFadingOut(false);
+          }
+        }, 300);
+      }, 1000);
+    },
+    [totalAyahs, onFinishSurah]
+  );
+
+  // Trigger retry when speech ends without passing (similarity < 80%)
+  const triggerRetry = useCallback(
+    (verseIndex: number) => {
+      if (isAdvancingRef.current) return;
+
+      setVerseStatus('retry');
+      setFailedAttempts((prev) => ({
+        ...prev,
+        [verseIndex]: (prev[verseIndex] || 0) + 1,
+      }));
+
+      // Clear spoken text after 1.5 seconds so user can try again on the same Ayah
+      retryClearTimerRef.current = setTimeout(() => {
+        setLiveSpokenText('');
+        setVerseStatus('idle');
+        setSimilarity(0);
+        clearSession();
+      }, 1500);
+    },
+    []
+  );
+
+  // Incoming speech transcript callback
+  const handleTranscript = useCallback(
+    (transcript: string, isFinal: boolean) => {
+      if (isAdvancingRef.current) return;
+
+      const trimmed = transcript.trim();
+      if (!trimmed) return;
+
+      const activeIdx = currentAyahIndexRef.current;
+      const expectedText = surahData.ayahs[activeIdx]?.text || '';
+
+      // Strip Basmalah prefix if recited before Ayah 1 of non-Fatihah surahs
+      const testSpoken =
+        activeIdx === 0 && !isSurahFatihah && !isSurahTawbah
+          ? stripBasmalahPrefix(trimmed)
+          : trimmed;
+
+      const matchResult = calculateAyahMatch(testSpoken, expectedText);
+
+      setLiveSpokenText(trimmed);
+      setSimilarity(matchResult.similarity);
+
+      // Check if match passed (>= 80%) immediately during speech!
+      if (matchResult.isPassed) {
+        triggerSuccessAdvance(activeIdx);
+        return;
+      }
+
+      // Not passed yet: update status to listening
+      setVerseStatus('listening');
+
+      // Reset existing silence detection timer
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+      }
+
+      // If user stops speaking for 1.4s, or if final result arrives with < 80%
+      const delayMs = isFinal ? 1100 : 1500;
+      silenceTimerRef.current = setTimeout(() => {
+        const finalCheck = calculateAyahMatch(testSpoken, expectedText);
+        if (finalCheck.isPassed) {
+          triggerSuccessAdvance(activeIdx);
+        } else {
+          // If transcript is very short (mic noise like "اه"), clear silently without penalty
+          if (testSpoken.length <= 2) {
+            setLiveSpokenText('');
+            setVerseStatus('idle');
+            clearSession();
+          } else {
+            triggerRetry(activeIdx);
+          }
+        }
+      }, delayMs);
+    },
+    [surahData.ayahs, isSurahFatihah, isSurahTawbah, triggerSuccessAdvance, triggerRetry]
+  );
+
+  const {
+    isListening,
+    error: speechError,
+    errorType,
+    isSupported,
+    startListening,
+    stopListening,
+    clearSession,
+  } = useSpeechRecognition({
+    onTranscript: handleTranscript,
+    lang: 'ar-SA',
+  });
+
+  // Start listening automatically on mount
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      startListening();
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [startListening]);
+
+  // Clean up all timers on unmount
+  useEffect(() => {
+    return () => {
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (retryClearTimerRef.current) clearTimeout(retryClearTimerRef.current);
+      if (advanceTimerRef.current) clearTimeout(advanceTimerRef.current);
+      if (hintAutoDismissRef.current) clearTimeout(hintAutoDismissRef.current);
+    };
+  }, []);
+
+  // Skip verse handler (permanent backup button)
+  const handleSkipAyah = () => {
+    if (isAdvancingRef.current) return;
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    if (retryClearTimerRef.current) clearTimeout(retryClearTimerRef.current);
+
+    setIsFadingOut(true);
+    setTimeout(() => {
+      setLiveSpokenText('');
+      setVerseStatus('idle');
+      setSimilarity(0);
+      clearSession();
+
+      const nextIdx = currentAyahIndex + 1;
+      if (nextIdx >= totalAyahs) {
+        stopListening();
+        onFinishSurah();
+      } else {
+        setCurrentAyahIndex(nextIdx);
+        setIsFadingOut(false);
+      }
+    }, 250);
+  };
+
+  const toggleMic = () => {
+    if (isListening) {
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      stopListening();
+    } else {
+      startListening();
     }
   };
 
+  const handleBackClicked = () => {
+    if (currentAyahIndex > 0) {
+      setShowExitConfirm(true);
+    } else {
+      stopListening();
+      onBackToIndex();
+    }
+  };
+
+  const confirmExit = () => {
+    stopListening();
+    onBackToIndex();
+  };
+
+  const toggleHint = () => {
+    setShowHint((prev) => {
+      const next = !prev;
+      if (next) {
+        if (hintAutoDismissRef.current) clearTimeout(hintAutoDismissRef.current);
+        hintAutoDismissRef.current = setTimeout(() => {
+          setShowHint(false);
+        }, 5000);
+      }
+      return next;
+    });
+  };
+
+  // Dynamic font sizing (auto-fit based on verse length so no scrolling is ever needed)
+  const displayedContent =
+    verseStatus === 'success'
+      ? targetAyahText
+      : liveSpokenText || targetAyahText;
+  const contentLength = displayedContent.length;
+
+  const getFontSizeClass = (len: number) => {
+    if (len <= 45) return 'text-2xl sm:text-3xl md:text-4xl leading-relaxed sm:leading-loose';
+    if (len <= 95) return 'text-xl sm:text-2xl md:text-3xl leading-relaxed sm:leading-loose';
+    if (len <= 165) return 'text-lg sm:text-xl md:text-2xl leading-relaxed';
+    if (len <= 260) return 'text-base sm:text-lg md:text-xl leading-normal';
+    return 'text-sm sm:text-base md:text-lg leading-normal';
+  };
+
+  const progressPercent = Math.min(
+    100,
+    Math.round(((currentAyahIndex) / totalAyahs) * 100)
+  );
+
   return (
-    <div className="w-full min-h-screen bg-[#faf9f5] dark:bg-[#121212] text-stone-900 dark:text-stone-100 flex flex-col font-arabic select-none transition-colors duration-200">
-      {/* 1. Minimal Top Navigation Bar */}
-      <header className="w-full max-w-4xl mx-auto px-4 sm:px-6 pt-5 pb-3 flex items-center justify-between border-b border-stone-200/40 dark:border-stone-800/40">
-        {/* Back to Index Button */}
+    <div
+      className="w-full h-[100dvh] max-h-[100dvh] bg-white text-stone-900 flex flex-col justify-between font-arabic select-none overflow-hidden relative"
+      dir="rtl"
+    >
+      {/* 1. Thin Progress Bar */}
+      <div className="w-full h-1 bg-stone-100 shrink-0 z-30">
+        <div
+          className="h-full bg-emerald-600 transition-all duration-300"
+          style={{ width: `${Math.max(5, progressPercent)}%` }}
+        />
+      </div>
+
+      {/* 2. Top Header (Compact & Fixed) */}
+      <header className="w-full px-4 pt-[max(env(safe-area-inset-top),14px)] pb-2 flex items-center justify-between border-b border-stone-100 bg-white/95 backdrop-blur-md shrink-0 z-20">
+        {/* Back Button */}
         <button
-          onClick={onBackToIndex}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-stone-700 dark:text-stone-200 hover:bg-stone-200/60 dark:hover:bg-stone-800 text-xs sm:text-sm font-semibold transition-all cursor-pointer"
-          title="العودة لفهرس سور القرآن"
+          onClick={handleBackClicked}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-stone-600 hover:text-stone-900 hover:bg-stone-50 text-xs font-semibold transition-colors"
         >
-          <ArrowRight className="w-4 h-4 text-amber-600 dark:text-amber-400" />
-          <span>فهرس السور</span>
+          <ArrowRight className="w-4 h-4 text-emerald-700" />
+          <span>الفهرس</span>
         </button>
 
-        {/* Center: Surah Title & Ayah Progress */}
+        {/* Surah Name & Counter */}
         <div className="text-center">
-          <div className="flex items-center justify-center gap-2">
-            <h2 className="font-quran font-bold text-lg sm:text-xl text-stone-900 dark:text-stone-100">
-              {formatSurahTitle(surahData.name)}
-            </h2>
-            <span className="text-[11px] font-medium text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 px-2 py-0.5 rounded-md border border-amber-200/60 dark:border-amber-800/60">
-              {surahData.revelationType}
-            </span>
-          </div>
-          <div className="text-[11px] text-stone-500 dark:text-stone-400 mt-0.5">
-            الآية {toArabicDigits(currentAyahIndex + 1)} من {toArabicDigits(surahData.numberOfAyahs)}
+          <h2 className="font-quran text-base sm:text-lg font-bold text-stone-900 leading-tight">
+            سُورَةُ {surahData.name}
+          </h2>
+          <div className="text-[11px] text-stone-500 font-medium">
+            الآية {toArabicDigits(currentAyahIndex + 1)} من {toArabicDigits(totalAyahs)}
           </div>
         </div>
 
-        {/* Right Tools: Font Size & Dark Mode */}
-        <div className="flex items-center gap-1">
-          <button
-            onClick={() => onChangeFontSize(-2)}
-            disabled={fontSize <= 24}
-            className="w-8 h-8 rounded-lg border border-stone-200 dark:border-stone-800 hover:bg-stone-100 dark:hover:bg-stone-800 text-stone-600 dark:text-stone-300 text-xs font-bold disabled:opacity-30 transition-colors"
-            title="تصغير الخط"
-          >
-            A-
-          </button>
-          <button
-            onClick={() => onChangeFontSize(2)}
-            disabled={fontSize >= 44}
-            className="w-8 h-8 rounded-lg border border-stone-200 dark:border-stone-800 hover:bg-stone-100 dark:hover:bg-stone-800 text-stone-600 dark:text-stone-300 text-xs font-bold disabled:opacity-30 transition-colors"
-            title="تكبير الخط"
-          >
-            A+
-          </button>
-          <button
-            onClick={onToggleDarkMode}
-            className="w-8 h-8 rounded-lg border border-stone-200 dark:border-stone-800 hover:bg-stone-100 dark:hover:bg-stone-800 flex items-center justify-center text-stone-600 dark:text-stone-300 transition-colors"
-            title={isDarkMode ? 'الوضع النهاري' : 'الوضع الليلي'}
-          >
-            {isDarkMode ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
-          </button>
+        {/* Progress Counter Badge */}
+        <div className="px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-800 text-xs font-bold border border-emerald-100">
+          {toArabicDigits(currentAyahIndex)} / {toArabicDigits(totalAyahs)}
         </div>
       </header>
 
-      {/* 2. Main Centered Ayah Display Area (Generous Space Above & Below) */}
-      <main className="w-full max-w-4xl mx-auto px-4 sm:px-6 flex-1 flex flex-col items-center justify-center my-auto py-12 sm:py-20 min-h-[50vh]">
-        {/* Basmalah Header (if Ayah 1 and not Tawbah and not Fatihah) */}
-        {isFirstAyah && !isSurahTawbah && !isSurahFatihah && (
-          <div className="mb-10 sm:mb-14 text-center font-quran text-2xl sm:text-3xl font-bold text-amber-800/90 dark:text-amber-400/90 tracking-wide select-none animate-in fade-in duration-300">
+      {/* Notice Banners (Compact, non-intrusive) */}
+      {errorType === 'offline_language_missing' && (
+        <div className="mx-4 mt-2 p-2.5 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-stone-800 shrink-0 animate-in fade-in duration-200">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+            <p className="text-[11px] text-stone-700 leading-snug">
+              <strong>وضع دون اتصال:</strong> لتفعيل التعرف أوفلاين، ثبّت حزمة العربية من
+              (إعدادات الهاتف ← Google ← التعرف الصوتي دون اتصال).
+            </p>
+          </div>
+        </div>
+      )}
+
+      {speechError && errorType !== 'offline_language_missing' && (
+        <div className="mx-4 mt-2 p-2 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-center justify-between shrink-0 animate-in fade-in duration-200">
+          <div className="flex items-center gap-1.5 truncate">
+            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span className="truncate">{speechError}</span>
+          </div>
+          <button
+            onClick={() => startListening()}
+            className="text-xs text-emerald-700 font-bold underline shrink-0 flex items-center gap-1 mr-2"
+          >
+            <RefreshCw className="w-3 h-3" />
+            <span>إعادة</span>
+          </button>
+        </div>
+      )}
+
+      {!isSupported && (
+        <div className="mx-4 mt-2 p-2 bg-red-50 border border-red-200 rounded-xl text-xs text-red-800 flex items-center gap-2 shrink-0">
+          <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+          <span>المتصفح لا يدعم التعرف على الصوت. يُفضل تطبيق أندرويد أو Chrome.</span>
+        </div>
+      )}
+
+      {/* 3. Center Verse Area (Strictly NO SCROLL, auto-fit font size, single verse only) */}
+      <main className="flex-1 w-full max-w-2xl mx-auto px-5 sm:px-8 flex flex-col items-center justify-center text-center overflow-hidden relative">
+        {/* Basmalah for start of Surah (Ayah 1) */}
+        {!isSurahTawbah && !isSurahFatihah && currentAyahIndex === 0 && (
+          <div className="font-quran text-sm sm:text-base text-emerald-800 font-semibold mb-4 select-none opacity-85">
             بِسْمِ ٱللَّهِ ٱلرَّحْمَـٰنِ ٱلرَّحِيمِ
           </div>
         )}
 
-        {/* Ayah Completion Banner Flash */}
-        {isAyahCompletedFlash && (
-          <div className="mb-6 flex items-center gap-2 px-4 py-2 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-700 dark:text-emerald-400 font-bold text-sm sm:text-base animate-in zoom-in-95 duration-200">
-            <CheckCircle2 className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
-            <span>ما شاء الله! أتممت الآية الكريمة، جاري الانتقال للآية التالية...</span>
-          </div>
-        )}
-
-        {/* Ayah Words Display - Only writes what the user has recited */}
-        {currentAyah ? (
-          <div className="w-full min-h-[140px] flex items-center justify-center">
-            {revealedAyahWordCount === 0 ? (
-              <div className="text-center py-8 px-4 animate-in fade-in duration-300">
-                <p className="text-stone-400/90 dark:text-stone-500 font-quran text-xl sm:text-2xl animate-pulse">
-                  اقرأ الآية من حفظك وسيتم كتابتها هنا فوراً...
-                </p>
-                <div className="mt-3 flex items-center justify-center gap-2 text-xs text-stone-400">
-                  <span className="font-semibold">الآية رقم {toArabicDigits(currentAyah.numberInSurah)}</span>
-                  <span>·</span>
-                  <span>({toArabicDigits(totalWords)} كلمات)</span>
-                </div>
-              </div>
-            ) : (
-              <div
-                className="w-full text-center font-quran leading-loose sm:leading-loose tracking-wide flex flex-wrap items-center justify-center gap-x-3 sm:gap-x-4 gap-y-3 sm:gap-y-4 px-2 sm:px-6"
-                style={{ fontSize: `${fontSize}px` }}
+        {/* Main Verse Transition Container */}
+        <div
+          className={`w-full flex flex-col items-center justify-center transition-opacity duration-300 ${
+            isFadingOut ? 'opacity-0' : 'opacity-100'
+          }`}
+        >
+          {verseStatus === 'success' ? (
+            /* Verified Match (>= 80%): authentic Uthmani text with full tashkeel in emerald + checkmark */
+            <div className="w-full flex flex-col items-center justify-center animate-in fade-in duration-200">
+              <p
+                className={`font-quran font-bold text-emerald-800 leading-relaxed ${getFontSizeClass(
+                  contentLength
+                )}`}
               >
-                {/* Only words that have been recited so far */}
-                {currentAyah.words.slice(0, revealedAyahWordCount).map((word, idx) => (
-                  <span
-                    key={word.id || idx}
-                    className="text-stone-900 dark:text-stone-50 font-bold drop-shadow-xs transition-all duration-150 animate-in zoom-in-95 inline-block"
-                  >
-                    {word.text}
-                  </span>
-                ))}
-
-                {/* Subtle blinking cursor while waiting for the user to recite the next word */}
-                {revealedAyahWordCount < totalWords && (
-                  <span
-                    className="inline-block w-1.5 h-8 bg-amber-500/80 rounded-full animate-pulse self-center mr-1"
-                    title="في انتظار نطق الكلمة التالية..."
-                  />
-                )}
-
-                {/* End of Ayah Ornament Symbol - Only appears when the entire Ayah is completed */}
-                {revealedAyahWordCount >= totalWords && (
-                  <span
-                    className="inline-flex items-center justify-center font-quran text-emerald-600 dark:text-emerald-400 text-lg sm:text-2xl font-bold mr-2 transition-all duration-300 scale-110 animate-in zoom-in-95"
-                  >
-                    ﴿{toArabicDigits(currentAyah.numberInSurah)}﴾
+                {targetAyahText}{' '}
+                <span className="font-quran text-emerald-700 font-bold inline-block mr-1">
+                  ﴿{toArabicDigits(currentAyahIndex + 1)}﴾
+                </span>
+              </p>
+              <div className="flex items-center gap-1.5 mt-4 px-3.5 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold animate-in zoom-in-95 duration-200">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                <span>صحيح ✓</span>
+              </div>
+            </div>
+          ) : verseStatus === 'retry' ? (
+            /* Failed attempt (< 80%): soft red/gray with gentle retry notice */
+            <div className="w-full flex flex-col items-center justify-center animate-in fade-in duration-150">
+              <p
+                className={`font-quran font-bold text-red-700/80 line-through decoration-red-300 leading-relaxed ${getFontSizeClass(
+                  contentLength
+                )}`}
+              >
+                {liveSpokenText}{' '}
+                <span className="font-quran text-red-500 font-normal inline-block mr-1">
+                  ﴿{toArabicDigits(currentAyahIndex + 1)}﴾
+                </span>
+              </p>
+              <div className="flex items-center gap-2 mt-4 px-3.5 py-1.5 rounded-full bg-red-50 border border-red-200 text-red-700 text-xs font-medium">
+                <span>حاول مرة تانية... اقرأ الآية بوضوح</span>
+                {similarity > 0 && (
+                  <span className="text-[11px] text-stone-400">
+                    ({toArabicDigits(similarity)}٪)
                   </span>
                 )}
               </div>
-            )}
-          </div>
-        ) : (
-          <div className="text-center text-stone-400 py-12">
-            <p>جاري تحميل آيات السورة الكريمة...</p>
-          </div>
-        )}
-
-        {/* Live Heard Word Feedback or Prompt */}
-        <div className="mt-8 sm:mt-12 text-center min-h-[32px] flex items-center justify-center">
-          {interimTranscript ? (
-            <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-stone-200/60 dark:bg-stone-800/80 text-stone-700 dark:text-stone-300 text-xs sm:text-sm font-medium animate-in fade-in">
-              <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping"></span>
-              <span>سمعت: «{interimTranscript}»</span>
             </div>
-          ) : isListening ? (
-            <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-emerald-500/10 dark:bg-emerald-500/15 border border-emerald-500/20 text-emerald-700 dark:text-emerald-400 text-xs sm:text-sm font-medium">
-              <span className="relative flex h-2 w-2">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-              </span>
-              <span>
-                {revealedAyahWordCount === 0
-                  ? 'الميكروفون يستمع... ابدأ قراءة الآية الكريمة من حفظك'
-                  : revealedAyahWordCount < totalWords
-                  ? 'الميكروفون يستمع... واصل التسميع بصوتك'
-                  : 'ما شاء الله! اكتملت الآية الكريمة'}
-              </span>
+          ) : liveSpokenText ? (
+            /* Interim speech: live spoken words word-by-word with end verse symbol */
+            <div className="w-full flex flex-col items-center justify-center">
+              <p
+                className={`font-quran font-bold text-stone-900 leading-relaxed ${getFontSizeClass(
+                  contentLength
+                )}`}
+              >
+                {liveSpokenText}
+                <span className="inline-block w-2 h-5 bg-emerald-600 rounded-full mr-1.5 animate-pulse align-middle" />{' '}
+                <span className="font-quran text-stone-400 font-normal inline-block mr-1">
+                  ﴿{toArabicDigits(currentAyahIndex + 1)}﴾
+                </span>
+              </p>
+              {similarity > 0 && (
+                <span className="text-[11px] text-stone-400 font-medium mt-3">
+                  نسبة التطابق: {toArabicDigits(similarity)}٪
+                </span>
+              )}
             </div>
           ) : (
-            <div className="text-xs text-stone-400 dark:text-stone-500">
-              اضغط على زر الميكروفون أدناه لبدء التسميع
+            /* Empty / Waiting state: end symbol ﴿num﴾ in soft style waiting for recitation */
+            <div className="w-full flex flex-col items-center justify-center py-2">
+              <div className="font-quran text-4xl sm:text-5xl text-stone-300 font-bold mb-4 select-none">
+                ﴿{toArabicDigits(currentAyahIndex + 1)}﴾
+              </div>
+              <p className="text-sm sm:text-base text-stone-400 font-arabic flex items-center justify-center gap-2">
+                {isListening ? (
+                  <>
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+                    <span className="text-emerald-800 font-medium">
+                      اقرأ الآية من حفظك في الميكروفون...
+                    </span>
+                  </>
+                ) : (
+                  <span>اضغط على الميكروفون وابدأ القراءة...</span>
+                )}
+              </p>
+            </div>
+          )}
+
+          {/* Hint Card (available after 3 failed attempts) */}
+          {isHintAvailable && verseStatus !== 'success' && (
+            <div className="mt-5 flex flex-col items-center">
+              <button
+                onClick={toggleHint}
+                className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-800 text-xs font-bold border border-amber-200 transition"
+              >
+                <Lightbulb className="w-3.5 h-3.5 text-amber-600" />
+                <span>{showHint ? 'إخفاء التلميح' : 'تلميح (أول كلمتين)'}</span>
+              </button>
+
+              {showHint && hintText && (
+                <div className="mt-2 px-4 py-2 bg-amber-50/90 border border-amber-200 rounded-xl text-center animate-in fade-in duration-200">
+                  <span className="text-xs text-stone-500 font-medium ml-1">
+                    أول كلمتين:
+                  </span>
+                  <span className="font-quran text-base sm:text-lg text-amber-950 font-bold">
+                    « {hintText} ... »
+                  </span>
+                </div>
+              )}
             </div>
           )}
         </div>
       </main>
 
-      {/* 3. Bottom Controls Area */}
-      <footer className="w-full max-w-2xl mx-auto px-4 pb-8 pt-4 flex flex-col items-center gap-4">
-        {/* Quick Stepper & Helper Actions */}
-        <div className="flex items-center justify-center gap-2 sm:gap-3 w-full">
-          <button
-            onClick={onPrevAyah}
-            disabled={currentAyahIndex <= 0}
-            className="flex items-center gap-1 px-3 py-2 rounded-xl border border-stone-200 dark:border-stone-800 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-25 disabled:pointer-events-none text-stone-700 dark:text-stone-300 text-xs sm:text-sm font-semibold transition-colors shadow-2xs"
-            title="الآية السابقة"
-          >
-            <ChevronRight className="w-4 h-4" />
-            <span className="hidden sm:inline">الآية السابقة</span>
-          </button>
-
-          <button
-            onClick={onResetAyah}
-            className="flex items-center gap-1 px-3 py-2 rounded-xl border border-stone-200 dark:border-stone-800 hover:bg-stone-100 dark:hover:bg-stone-800 text-stone-700 dark:text-stone-300 text-xs sm:text-sm font-semibold transition-colors shadow-2xs"
-            title="إعادة تسميع الآية الحالية من البداية"
-          >
-            <RotateCcw className="w-3.5 h-3.5 text-stone-500" />
-            <span>إعادة الآية</span>
-          </button>
-
-          <button
-            onClick={onHintWord}
-            disabled={revealedAyahWordCount >= totalWords}
-            className="flex items-center gap-1 px-3 py-2 rounded-xl border border-amber-300 dark:border-amber-700/60 bg-amber-500/10 hover:bg-amber-500/20 text-amber-800 dark:text-amber-300 text-xs sm:text-sm font-semibold transition-colors shadow-2xs disabled:opacity-30 disabled:pointer-events-none"
-            title="إظهار الكلمة التالية كتلميح"
-          >
-            <HelpCircle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
-            <span>تلميح كلمة</span>
-          </button>
-
-          <button
-            onClick={onNextAyah}
-            disabled={currentAyahIndex >= surahData.numberOfAyahs - 1}
-            className="flex items-center gap-1 px-3 py-2 rounded-xl border border-stone-200 dark:border-stone-800 hover:bg-stone-100 dark:hover:bg-stone-800 disabled:opacity-25 disabled:pointer-events-none text-stone-700 dark:text-stone-300 text-xs sm:text-sm font-semibold transition-colors shadow-2xs"
-            title="تخطي للآية التالية"
-          >
-            <span className="hidden sm:inline">الآية التالية</span>
-            <ChevronLeft className="w-4 h-4" />
-          </button>
-        </div>
-
-        {/* Primary Big Microphone Button */}
-        <div className="flex flex-col items-center gap-2">
-          <button
-            onClick={onToggleListening}
-            className={`flex items-center gap-3 px-6 sm:px-8 py-3.5 rounded-full font-bold text-sm sm:text-base transition-all duration-300 shadow-md cursor-pointer ${
-              isListening
-                ? 'bg-emerald-600 hover:bg-emerald-700 text-white ring-4 ring-emerald-500/30'
-                : 'bg-stone-800 hover:bg-stone-900 text-white dark:bg-stone-200 dark:hover:bg-white dark:text-stone-900 ring-2 ring-transparent'
-            }`}
-          >
+      {/* 4. Fixed Bottom Controls (Microphone + Skip Button) */}
+      <footer className="w-full shrink-0 bg-white/95 backdrop-blur-md border-t border-stone-100 px-6 pt-3 pb-[max(env(safe-area-inset-bottom),18px)] flex flex-col items-center">
+        <div className="w-full max-w-sm flex items-center justify-between">
+          {/* Listening Status Badge */}
+          <div className="w-24 flex items-center justify-start text-[11px] font-bold">
             {isListening ? (
-              <>
-                <Mic className="w-5 h-5 text-white animate-pulse" />
-                <span>الميكروفون يستمع (انقر للإيقاف)</span>
-              </>
+              <span className="text-emerald-700 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-600 animate-ping" />
+                <span>جاري الاستماع</span>
+              </span>
             ) : (
-              <>
-                <MicOff className="w-5 h-5 opacity-80" />
-                <span>ابدأ التسميع الصوتي</span>
-              </>
+              <span className="text-stone-400">متوقف</span>
             )}
-          </button>
+          </div>
 
-          {/* Toggle manual text entry test bar */}
-          <button
-            onClick={() => setShowKeyInput(!showKeyInput)}
-            className="text-[11px] text-stone-400 hover:text-stone-600 dark:hover:text-stone-300 underline mt-1 cursor-pointer"
-          >
-            {showKeyInput ? 'إخفاء الكتابة اليدوية' : 'أو اكتب للتجربة بدون ميكروفون'}
-          </button>
+          {/* Large Central Microphone Button */}
+          <div className="relative flex flex-col items-center">
+            {isListening && (
+              <span className="absolute -inset-2.5 rounded-full bg-emerald-500/20 animate-ping pointer-events-none" />
+            )}
+            <button
+              onClick={toggleMic}
+              className={`relative z-10 w-16 h-16 sm:w-18 sm:h-18 rounded-full flex items-center justify-center shadow-lg transition-all active:scale-95 ${
+                isListening
+                  ? 'bg-emerald-600 text-white ring-4 ring-emerald-500/30 shadow-emerald-600/30'
+                  : 'bg-stone-900 text-white hover:bg-stone-800 shadow-stone-900/20'
+              }`}
+              title={isListening ? 'إيقاف الاستماع' : 'بدء الاستماع والتسميع'}
+            >
+              {isListening ? (
+                <Mic className="w-8 h-8 animate-pulse" />
+              ) : (
+                <MicOff className="w-7 h-7 opacity-85" />
+              )}
+            </button>
+          </div>
+
+          {/* Skip Button (Permanent backup) */}
+          <div className="w-24 flex items-center justify-end">
+            <button
+              onClick={handleSkipAyah}
+              className="flex items-center gap-1 px-3 py-2 rounded-xl border border-stone-200 text-stone-700 hover:bg-stone-50 hover:text-stone-900 text-xs font-semibold transition active:scale-95 shadow-sm"
+              title="تخطي هذه الآية والانتقال للآية التالية"
+            >
+              <span>تخطي</span>
+              <SkipForward className="w-3.5 h-3.5 rotate-180 text-stone-500" />
+            </button>
+          </div>
         </div>
 
-        {/* Simulation / Text Input Bar if opened */}
-        {showKeyInput && (
-          <form
-            onSubmit={handleSimulateSubmit}
-            className="w-full max-w-md flex items-center gap-2 mt-1 animate-in fade-in"
-          >
-            <input
-              type="text"
-              value={typedText}
-              onChange={(e) => setTypedText(e.target.value)}
-              placeholder="اكتب كلمة أو آية واضغط إرسال..."
-              className="flex-1 px-3.5 py-2 rounded-xl bg-white dark:bg-stone-900 border border-stone-300 dark:border-stone-700 text-sm focus:outline-hidden focus:ring-2 focus:ring-amber-500"
-            />
-            <button
-              type="submit"
-              className="px-4 py-2 rounded-xl bg-amber-600 text-white text-sm font-semibold hover:bg-amber-700 flex items-center gap-1 shadow-xs"
-            >
-              <Send className="w-4 h-4" />
-              <span>إرسال</span>
-            </button>
-          </form>
-        )}
+        {/* Helper Note */}
+        <p className="mt-2 text-[11px] text-stone-400 font-arabic select-none text-center">
+          {isListening
+            ? 'اقرأ الآية بنسبة ٧٠٪ أو أكثر لتثبيتها والانتقال تلقائياً'
+            : 'اضغط على الميكروفون للبدء'}
+        </p>
       </footer>
 
-      {/* Surah Completion Modal */}
-      {isSurahFinished && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in">
-          <div className="w-full max-w-md bg-[#faf9f5] dark:bg-[#1a1a1a] rounded-3xl p-6 sm:p-8 border border-amber-500/40 shadow-2xl text-center font-arabic">
-            <div className="w-16 h-16 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 mx-auto flex items-center justify-center mb-4">
-              <CheckCircle2 className="w-8 h-8" />
-            </div>
-
-            <h3 className="text-xl sm:text-2xl font-bold font-quran text-stone-900 dark:text-stone-100 mb-2">
-              هَنِيئًا لَك!
+      {/* 5. Exit Confirmation Modal */}
+      {showExitConfirm && (
+        <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl p-6 max-w-sm w-full text-center shadow-2xl border border-stone-100 animate-in fade-in zoom-in-95 duration-200">
+            <h3 className="font-quran text-xl font-bold text-stone-900 mb-2">
+              العودة إلى الفهرس؟
             </h3>
-            <p className="text-sm text-stone-600 dark:text-stone-300 mb-6">
-              تم بحمد الله إتمام تسميع {formatSurahTitle(surahData.name)} كاملاً ({toArabicDigits(surahData.numberOfAyahs)} آية).
+            <p className="text-xs text-stone-500 mb-6 font-arabic leading-relaxed">
+              لقد بدأت في تسميع سورة {surahData.name}. هل تريد إيقاف التسميع والعودة لقائمة السور؟
             </p>
-
-            <div className="flex flex-col gap-2.5">
-              {hasNextSurah && onNextSurah && (
-                <button
-                  onClick={onNextSurah}
-                  className="w-full py-3 rounded-2xl bg-amber-600 hover:bg-amber-700 text-white font-bold text-sm shadow-md transition-all cursor-pointer"
-                >
-                  الانتقال للسورة التالية
-                </button>
-              )}
-
+            <div className="flex gap-3">
               <button
-                onClick={onRestartSurah}
-                className="w-full py-2.5 rounded-2xl border border-stone-300 dark:border-stone-700 hover:bg-stone-100 dark:hover:bg-stone-800 text-stone-800 dark:text-stone-200 font-semibold text-sm transition-colors cursor-pointer"
+                onClick={() => setShowExitConfirm(false)}
+                className="flex-1 py-2.5 rounded-xl border border-stone-200 text-stone-700 text-xs font-semibold hover:bg-stone-50 transition"
               >
-                إعادة تسميع السورة
+                متابعة التسميع
               </button>
-
               <button
-                onClick={onBackToIndex}
-                className="w-full py-2.5 rounded-2xl text-stone-500 hover:text-stone-800 dark:hover:text-stone-200 text-sm font-semibold transition-colors cursor-pointer"
+                onClick={confirmExit}
+                className="flex-1 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-semibold transition"
               >
-                العودة لفهرس القرآن الكريم
+                تأكيد الخروج
               </button>
             </div>
           </div>

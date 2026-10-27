@@ -2,6 +2,13 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { SpeechRecognition as NativeSpeechRecognition } from '@capacitor-community/speech-recognition';
 
+export type SpeechErrorType =
+  | 'permission_denied'
+  | 'offline_language_missing'
+  | 'unsupported'
+  | 'generic'
+  | null;
+
 interface SpeechRecognitionHookOptions {
   onTranscript?: (transcript: string, isFinal: boolean) => void;
   lang?: string;
@@ -14,6 +21,7 @@ export function useSpeechRecognition({
   const [isListening, setIsListening] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [errorType, setErrorType] = useState<SpeechErrorType>(null);
   const [isSupported, setIsSupported] = useState(true);
   const [audioLevel, setAudioLevel] = useState(0);
 
@@ -163,6 +171,7 @@ export function useSpeechRecognition({
       if (permStatus.speechRecognition !== 'granted') {
         const reqResult = await NativeSpeechRecognition.requestPermissions();
         if (reqResult.speechRecognition !== 'granted') {
+          setErrorType('permission_denied');
           setError('لم يتم منح إذن الميكروفون. يرجى السماح للتطبيق بالوصول إلى الميكروفون من إعدادات الهاتف لتتمكن من التسميع.');
           setIsListening(false);
           shouldListenRef.current = false;
@@ -173,7 +182,8 @@ export function useSpeechRecognition({
       // 2. Check Service Availability
       const avail = await NativeSpeechRecognition.available();
       if (!avail.available) {
-        setError('خدمة التعرف الصوتي غير متوفرة على هذا الجهاز. يرجى التحقق من تثبيت تطبيق خدمات Google وتفعيله.');
+        setErrorType('unsupported');
+        setError('خدمة التعرف الصوتي غير متوفرة على هذا الجهاز. يرجى التحقق من تفعيل خدمات Google.');
         setIsListening(false);
         shouldListenRef.current = false;
         return;
@@ -211,6 +221,7 @@ export function useSpeechRecognition({
           if (data.status === 'started') {
             setIsListening(true);
             setError(null);
+            setErrorType(null);
           } else if (data.status === 'stopped') {
             // Auto restart if listening was not manually stopped
             if (shouldListenRef.current) {
@@ -226,8 +237,13 @@ export function useSpeechRecognition({
                       partialResults: true,
                       popup: false,
                     });
-                  } catch (err) {
+                  } catch (err: any) {
                     console.warn('Native auto-restart notice:', err);
+                    const msg = String(err?.message || err).toLowerCase();
+                    if (msg.includes('network') || msg.includes('server') || msg.includes('offline')) {
+                      setErrorType('offline_language_missing');
+                      setError('حزمة اللغة العربية للتعرف دون اتصال غير مثبتة على الهاتف.');
+                    }
                   }
                 }
               }, 200);
@@ -251,10 +267,22 @@ export function useSpeechRecognition({
       });
 
       setIsListening(true);
+      setError(null);
+      setErrorType(null);
       startAudioVisualizer();
     } catch (err: any) {
-      console.error('Failed to start native speech recognition:', err);
-      setError('حدث خطأ أثناء تشغيل الميكروفون. يرجى إعادة المحاولة.');
+      console.warn('Native speech recognition notice:', err);
+      const msg = String(err?.message || err).toLowerCase();
+      if (msg.includes('network') || msg.includes('server') || msg.includes('offline')) {
+        setErrorType('offline_language_missing');
+        setError('حزمة اللغة العربية للتعرف دون اتصال غير مثبتة على الهاتف.');
+      } else if (msg.includes('permission') || msg.includes('denied')) {
+        setErrorType('permission_denied');
+        setError('لم يتم منح إذن الميكروفون.');
+      } else {
+        setErrorType('generic');
+        setError('حدث خطأ أثناء تشغيل الميكروفون. يمكنك الضغط على الميكروفون لإعادة المحاولة أو تخطي الآية.');
+      }
       setIsListening(false);
       shouldListenRef.current = false;
       stopAudioVisualizer();
@@ -264,12 +292,14 @@ export function useSpeechRecognition({
   // Start Web Listening using Web Speech API
   const startWebListening = useCallback(() => {
     setError(null);
+    setErrorType(null);
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
       setIsSupported(false);
-      setError('المتصفح الحالي لا يدعم التعرف على الصوت عبر Web Speech API.');
+      setErrorType('unsupported');
+      setError('المتصفح الحالي لا يدعم التعرف على الصوت.');
       return;
     }
 
@@ -295,6 +325,7 @@ export function useSpeechRecognition({
       recognition.onstart = () => {
         setIsListening(true);
         setError(null);
+        setErrorType(null);
         resultOffsetRef.current = 0;
         latestResultCountRef.current = 0;
         startAudioVisualizer();
@@ -335,6 +366,7 @@ export function useSpeechRecognition({
           return;
         }
         if (event.error === 'not-allowed') {
+          setErrorType('permission_denied');
           setError('لم يتم منح إذن الميكروفون. يرجى السماح بالوصول للميكروفون من إعدادات المتصفح.');
           shouldListenRef.current = false;
           setIsListening(false);
@@ -342,7 +374,8 @@ export function useSpeechRecognition({
           return;
         }
         if (event.error === 'network') {
-          setError('حدث خطأ في الاتصال بخدمة التعرف الصوتي.');
+          setErrorType('offline_language_missing');
+          setError('التعرف على الصوت يحتاج حزمة اللغة العربية دون اتصال.');
         }
       };
 
@@ -429,6 +462,7 @@ export function useSpeechRecognition({
     interimTranscript,
     audioLevel,
     error,
+    errorType,
     isSupported,
     startListening,
     stopListening,

@@ -420,3 +420,225 @@ export function formatSurahTitle(name: string): string {
   return clean ? `سورة ${clean}` : name;
 }
 
+/**
+ * Phonetically normalizes Arabic text for speech recognition comparison,
+ * completely ignoring Tajweed rules (no madd, no ghunnah, no idgham, no waqf):
+ * - Strips all diacritics / tashkeel / madd signs / tatweel / waqf marks
+ * - Unifies Alif forms: [إأآٱ] -> ا
+ * - Unifies Taa Marbuta & Haa: ة -> ه
+ * - Unifies Alef Maqsura & Yaa: ى -> ي
+ * - Unifies Hamza carriers
+ * - Unifies phonetically equivalent consonants confused in Arabic speech recognition / accents:
+ *     ض / ظ -> ض
+ *     س / ص -> س
+ *     ذ / ز / ث -> ز
+ *     ط / ت -> ت
+ *     ق / ك -> ك
+ *     أ / ا / ع -> ا (to tolerate muffled ayn / alif confusion in speech engines)
+ * - Collapses any elongated letters (e.g. الضاليننن -> الضالين)
+ */
+export function phoneticNormalizeArabic(text: string): string {
+  if (!text) return '';
+
+  let norm = normalizeArabic(text);
+
+  // Unify phonetic pairs as requested:
+  // ض / ظ -> ض
+  norm = norm.replace(/ظ/g, 'ض');
+  // س / ص -> س
+  norm = norm.replace(/ص/g, 'س');
+  // ذ / ز / ث -> ز
+  norm = norm.replace(/[ذث]/g, 'ز');
+  // ت / ط -> ت
+  norm = norm.replace(/ط/g, 'ت');
+  // ق / ك -> ك
+  norm = norm.replace(/ق/g, 'ك');
+  // أ / ا / ع -> ا (tolerating muffled ayn/alif confusion in speech engines)
+  norm = norm.replace(/ع/g, 'ا');
+
+  // Collapse repeated characters caused by voice elongation / tajweed madd
+  norm = norm.replace(/(.)\1+/g, '$1');
+
+  return norm.trim();
+}
+
+/**
+ * Checks whether a spoken word matches an expected Quranic word with tolerance:
+ * 1. Exact normalized match
+ * 2. Phonetic equivalence (ض/ظ, س/ص, ذ/ز/ث, ت/ط, ق/ك, أ/ع)
+ * 3. Prefix tolerance (attached/detached و, ف, ب, ل, ال)
+ * 4. Tanween noon/alif tolerance
+ * 5. Levenshtein edit distance tolerance
+ */
+export function isTolerantWordMatch(spoken: string, expected: string): boolean {
+  if (!spoken || !expected) return false;
+
+  const spkPhonetic = phoneticNormalizeArabic(spoken);
+  const expPhonetic = phoneticNormalizeArabic(expected);
+
+  if (spkPhonetic === expPhonetic) return true;
+
+  // Attached or detached prefix particles (و, ف, ب, ل, ال)
+  if (
+    spkPhonetic === 'و' + expPhonetic ||
+    expPhonetic === 'و' + spkPhonetic ||
+    spkPhonetic === 'ف' + expPhonetic ||
+    expPhonetic === 'ف' + spkPhonetic ||
+    spkPhonetic === 'ب' + expPhonetic ||
+    expPhonetic === 'ب' + spkPhonetic ||
+    spkPhonetic === 'ل' + expPhonetic ||
+    expPhonetic === 'ل' + spkPhonetic ||
+    spkPhonetic === 'ال' + expPhonetic ||
+    expPhonetic === 'ال' + spkPhonetic
+  ) {
+    return true;
+  }
+
+  // Tanween ending tolerance (e.g. عذابن vs عذاب, احدا vs احد)
+  if (
+    (spkPhonetic.endsWith('ن') && spkPhonetic.slice(0, -1) === expPhonetic) ||
+    (expPhonetic.endsWith('ن') && expPhonetic.slice(0, -1) === spkPhonetic) ||
+    (spkPhonetic.endsWith('ا') && spkPhonetic.slice(0, -1) === expPhonetic) ||
+    (expPhonetic.endsWith('ا') && expPhonetic.slice(0, -1) === spkPhonetic)
+  ) {
+    return true;
+  }
+
+  // Levenshtein distance on phonetically normalized words
+  const dist = levenshteinDistance(spkPhonetic, expPhonetic);
+  if (expPhonetic.length <= 3) {
+    return dist <= 1;
+  }
+  return dist <= 2;
+}
+
+/**
+ * Calculates match percentage (0 to 100) between spoken transcript and target Ayah.
+ * Follows completely Tajweed-free, tolerant Arabic word matching:
+ * - strips diacritics / tashkeel / tatweel / madd
+ * - unifies alifs (أ إ آ ٱ -> ا)
+ * - unifies yaa and alef maqsura (ي ى -> ي)
+ * - unifies taa marbuta and haa (ة -> ه)
+ * - ignores pause marks and waqf
+ * - equates phonetic pairs: ض/ظ, س/ص, ذ/ز, ت/ط, ق/ك, أ/ع
+ * - evaluates word-level sequence (passes at >= 70% of words)
+ */
+export function calculateAyahMatch(
+  spoken: string,
+  expected: string
+): {
+  similarity: number;
+  isPassed: boolean;
+  matchedWordsCount: number;
+  totalWords: number;
+} {
+  const normSpoken = normalizeArabic(spoken);
+  const normExpected = normalizeArabic(expected);
+
+  if (!normExpected) {
+    return { similarity: 100, isPassed: true, matchedWordsCount: 0, totalWords: 0 };
+  }
+  if (!normSpoken) {
+    return { similarity: 0, isPassed: false, matchedWordsCount: 0, totalWords: 0 };
+  }
+
+  // Split into words
+  const expectedWords = normExpected.split(/\s+/).filter(Boolean);
+  const spokenWords = normSpoken.split(/\s+/).filter(Boolean);
+  const totalWords = expectedWords.length;
+
+  if (totalWords === 0) {
+    return { similarity: 100, isPassed: true, matchedWordsCount: 0, totalWords: 0 };
+  }
+
+  // 1. Exact or whole-string phonetic match
+  const wholeSpkPhonetic = phoneticNormalizeArabic(spoken);
+  const wholeExpPhonetic = phoneticNormalizeArabic(expected);
+  if (wholeSpkPhonetic === wholeExpPhonetic) {
+    return {
+      similarity: 100,
+      isPassed: true,
+      matchedWordsCount: totalWords,
+      totalWords,
+    };
+  }
+
+  // 2. Word-level forward matching in approximate order
+  // Tolerates missing words, extra filler words, or merged tokens
+  let matchedCount = 0;
+  let sIdx = 0;
+
+  for (let eIdx = 0; eIdx < expectedWords.length; eIdx++) {
+    const expWord = expectedWords[eIdx];
+    let found = false;
+
+    // Lookahead up to 4 tokens in spoken words
+    const maxLookahead = Math.min(spokenWords.length, sIdx + 4);
+    for (let i = sIdx; i < maxLookahead; i++) {
+      if (isTolerantWordMatch(spokenWords[i], expWord)) {
+        matchedCount++;
+        sIdx = i + 1;
+        found = true;
+        break;
+      }
+
+      // Check if two spoken tokens merged to match this expected word
+      if (i + 1 < spokenWords.length) {
+        const combined = spokenWords[i] + spokenWords[i + 1];
+        if (isTolerantWordMatch(combined, expWord)) {
+          matchedCount++;
+          sIdx = i + 2;
+          found = true;
+          break;
+        }
+      }
+    }
+
+    // Fallback scan across remaining spoken tokens
+    if (!found) {
+      for (let i = sIdx; i < spokenWords.length; i++) {
+        if (isTolerantWordMatch(spokenWords[i], expWord)) {
+          matchedCount++;
+          sIdx = i + 1;
+          break;
+        }
+      }
+    }
+  }
+
+  // Check whole phonetic string similarity (handles continuous recitation)
+  const dist = levenshteinDistance(wholeSpkPhonetic, wholeExpPhonetic);
+  const maxLen = Math.max(wholeSpkPhonetic.length, wholeExpPhonetic.length);
+  const wholeRatio = maxLen > 0 ? Math.max(0, 1 - dist / maxLen) : 0;
+
+  let wordRatio = totalWords > 0 ? matchedCount / totalWords : 0;
+
+  // Tolerance for 1 missing word in short verses (e.g. 2 of 3 words)
+  if (totalWords <= 3 && matchedCount >= totalWords - 1 && matchedCount >= 2) {
+    wordRatio = Math.max(wordRatio, 0.70);
+  }
+
+  // Combined score: high weight on word-level matching
+  const combinedScore = Math.max(wordRatio, wholeRatio);
+  const similarity = Math.min(100, Math.round(combinedScore * 100));
+  const isPassed = similarity >= 70; // 70% threshold as requested!
+
+  return {
+    similarity,
+    isPassed,
+    matchedWordsCount: matchedCount,
+    totalWords,
+  };
+}
+
+/**
+ * Returns the first 2 words of an Ayah for hint assistance
+ */
+export function getFirstTwoWords(text: string): string {
+  if (!text) return '';
+  const cleanTokens = text.replace(PUNCTUATION_REGEX, ' ').split(/\s+/).filter(Boolean);
+  return cleanTokens.slice(0, 2).join(' ');
+}
+
+
+
