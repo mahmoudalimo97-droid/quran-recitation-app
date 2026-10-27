@@ -24,7 +24,7 @@ jobs:
           node-version: 20
           cache: npm
 
-      - name: Setup Java
+      - name: Setup Java (Capacitor 7 -> Java 21)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -43,7 +43,18 @@ jobs:
         working-directory: android
         run: |
           chmod +x ./gradlew
-          ./gradlew assembleDebug --stacktrace
+          ./gradlew clean
+          ./gradlew assembleDebug --stacktrace --console=plain 2>&1 | tee gradle.log
+
+      - name: Diagnostic output on Gradle failure
+        if: failure()
+        working-directory: android
+        run: |
+          if [ -f gradle.log ]; then
+            echo "==================== GRADLE ERROR SUMMARY ===================="
+            grep -E -i -C 3 "(What went wrong|error:|FAILURE)" gradle.log || tail -n 60 gradle.log
+            echo "=============================================================="
+          fi
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
