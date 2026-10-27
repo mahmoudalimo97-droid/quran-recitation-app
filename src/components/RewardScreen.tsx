@@ -37,12 +37,12 @@ export const RewardScreen: React.FC<RewardScreenProps> = ({
         </div>
 
         {/* Title & Surah Name */}
-        <h1 className="font-quran text-3xl sm:text-4xl font-bold text-stone-900 mb-2">
+        <h1 className="font-quran text-3xl sm:text-4xl font-bold text-stone-900 mb-3">
           بَارَكَ ٱللَّهُ فِيك
         </h1>
 
         <p className="text-base sm:text-lg text-emerald-800 font-semibold mb-8">
-          أتممت حفظ سورة {surahData.name}
+          أتممت سورة {surahData.name}
         </p>
 
         {/* Exactly 2 Buttons */}

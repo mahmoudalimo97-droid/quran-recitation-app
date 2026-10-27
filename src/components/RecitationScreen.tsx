@@ -6,18 +6,10 @@ import {
   SkipForward,
   AlertCircle,
   RefreshCw,
-  CheckCircle2,
-  Lightbulb,
 } from 'lucide-react';
 import { QuranSurahData } from '../types/quran';
 import { Capacitor } from '@capacitor/core';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
-import {
-  calculateAyahMatch,
-  getFirstTwoWords,
-  normalizeArabic,
-  phoneticNormalizeArabic,
-} from '../utils/arabicMatcher';
 
 interface RecitationScreenProps {
   surahData: QuranSurahData;
@@ -34,25 +26,6 @@ function toArabicDigits(num: number): string {
     .join('');
 }
 
-// Strips leading "بسم الله الرحمن الرحيم" if user speaks it before Ayah 1 of any surah other than Fatihah
-function stripBasmalahPrefix(spokenText: string): string {
-  const norm = normalizeArabic(spokenText);
-  const basmalahNorm = 'بسم الله الرحمن الرحيم';
-  if (norm.startsWith(basmalahNorm)) {
-    return norm.slice(basmalahNorm.length).trim();
-  }
-  const phon = phoneticNormalizeArabic(spokenText);
-  const basmalahPhon = phoneticNormalizeArabic(basmalahNorm);
-  if (phon.startsWith(basmalahPhon)) {
-    // Return approximate remainder
-    const words = spokenText.trim().split(/\s+/);
-    if (words.length > 4) {
-      return words.slice(4).join(' ');
-    }
-  }
-  return spokenText;
-}
-
 export const RecitationScreen: React.FC<RecitationScreenProps> = ({
   surahData,
   onBackToIndex,
@@ -65,49 +38,27 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
   // Active state
   const [currentAyahIndex, setCurrentAyahIndex] = useState<number>(0);
   const [liveSpokenText, setLiveSpokenText] = useState<string>('');
-  const [verseStatus, setVerseStatus] = useState<
-    'idle' | 'listening' | 'success' | 'retry'
-  >('idle');
-  const [similarity, setSimilarity] = useState<number>(0);
-  const [failedAttempts, setFailedAttempts] = useState<Record<number, number>>({});
-  const [showHint, setShowHint] = useState<boolean>(false);
   const [isFadingOut, setIsFadingOut] = useState<boolean>(false);
   const [showExitConfirm, setShowExitConfirm] = useState<boolean>(false);
 
   // References
   const silenceTimerRef = useRef<any>(null);
-  const retryClearTimerRef = useRef<any>(null);
-  const advanceTimerRef = useRef<any>(null);
-  const hintAutoDismissRef = useRef<any>(null);
-  const currentAyahIndexRef = useRef(currentAyahIndex);
   const isAdvancingRef = useRef(false);
-
+  const currentAyahIndexRef = useRef(currentAyahIndex);
   useEffect(() => {
     currentAyahIndexRef.current = currentAyahIndex;
-    setShowHint(false);
   }, [currentAyahIndex]);
 
-  // Target text of current Ayah
-  const currentAyah = surahData.ayahs[currentAyahIndex];
-  const targetAyahText = currentAyah?.text || '';
-  const currentFailedCount = failedAttempts[currentAyahIndex] || 0;
-  const isHintAvailable = currentFailedCount >= 3;
-  const hintText = targetAyahText ? getFirstTwoWords(targetAyahText) : '';
-
-  // Trigger advance when a verse is recited successfully
-  const triggerSuccessAdvance = useCallback(
+  // Clean transition to the next Ayah after user stops speaking for ~2s
+  const advanceToNextAyah = useCallback(
     (verseIndex: number) => {
       if (isAdvancingRef.current) return;
       isAdvancingRef.current = true;
 
-      // Clear any pending timers
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-      if (retryClearTimerRef.current) clearTimeout(retryClearTimerRef.current);
 
-      setVerseStatus('success');
-
-      // Wait ~1000ms, then fade out and transition to the next verse with zero scroll
-      advanceTimerRef.current = setTimeout(() => {
+      // Keep text fixed for 500ms, then smooth fade transition
+      setTimeout(() => {
         setIsFadingOut(true);
 
         setTimeout(() => {
@@ -118,95 +69,38 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
           } else {
             clearSession();
             setLiveSpokenText('');
-            setVerseStatus('idle');
-            setSimilarity(0);
             isAdvancingRef.current = false;
             setCurrentAyahIndex(nextIdx);
             setIsFadingOut(false);
           }
         }, 300);
-      }, 1000);
+      }, 500);
     },
     [totalAyahs, onFinishSurah]
   );
 
-  // Trigger retry when speech ends without passing (similarity < 80%)
-  const triggerRetry = useCallback(
-    (verseIndex: number) => {
-      if (isAdvancingRef.current) return;
-
-      setVerseStatus('retry');
-      setFailedAttempts((prev) => ({
-        ...prev,
-        [verseIndex]: (prev[verseIndex] || 0) + 1,
-      }));
-
-      // Clear spoken text after 1.5 seconds so user can try again on the same Ayah
-      retryClearTimerRef.current = setTimeout(() => {
-        setLiveSpokenText('');
-        setVerseStatus('idle');
-        setSimilarity(0);
-        clearSession();
-      }, 1500);
-    },
-    []
-  );
-
-  // Incoming speech transcript callback
+  // Live Scribe speech transcript callback (no matching, no normalization)
   const handleTranscript = useCallback(
-    (transcript: string, isFinal: boolean) => {
+    (transcript: string) => {
       if (isAdvancingRef.current) return;
 
       const trimmed = transcript.trim();
       if (!trimmed) return;
 
-      const activeIdx = currentAyahIndexRef.current;
-      const expectedText = surahData.ayahs[activeIdx]?.text || '';
-
-      // Strip Basmalah prefix if recited before Ayah 1 of non-Fatihah surahs
-      const testSpoken =
-        activeIdx === 0 && !isSurahFatihah && !isSurahTawbah
-          ? stripBasmalahPrefix(trimmed)
-          : trimmed;
-
-      const matchResult = calculateAyahMatch(testSpoken, expectedText);
-
+      // Update spoken text live on screen as said
       setLiveSpokenText(trimmed);
-      setSimilarity(matchResult.similarity);
 
-      // Check if match passed (>= 80%) immediately during speech!
-      if (matchResult.isPassed) {
-        triggerSuccessAdvance(activeIdx);
-        return;
-      }
-
-      // Not passed yet: update status to listening
-      setVerseStatus('listening');
-
-      // Reset existing silence detection timer
+      // Reset silence detection timer
       if (silenceTimerRef.current) {
         clearTimeout(silenceTimerRef.current);
       }
 
-      // If user stops speaking for 1.4s, or if final result arrives with < 80%
-      const delayMs = isFinal ? 1100 : 1500;
+      // When user pauses/stops speaking for ~2 seconds after writing text -> advance to next ayah
       silenceTimerRef.current = setTimeout(() => {
-        const finalCheck = calculateAyahMatch(testSpoken, expectedText);
-        if (finalCheck.isPassed) {
-          triggerSuccessAdvance(activeIdx);
-        } else {
-          // If transcript is very short (mic noise like "اه"), clear silently without penalty
-          if (testSpoken.length <= 2) {
-            setLiveSpokenText('');
-            setVerseStatus('idle');
-            clearSession();
-          } else {
-            triggerRetry(activeIdx);
-          }
-        }
-      }, delayMs);
+        advanceToNextAyah(currentAyahIndexRef.current);
+      }, 2000);
     },
-    [surahData.ayahs, isSurahFatihah, isSurahTawbah, triggerSuccessAdvance, triggerRetry]
+    [advanceToNextAyah]
   );
 
   const {
@@ -223,48 +117,28 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
     lang: 'ar-SA',
   });
 
-  // Start listening automatically on mount
+  // Start listening automatically on screen enter
   useEffect(() => {
     const timer = setTimeout(() => {
       startListening();
-    }, 350);
+    }, 300);
     return () => clearTimeout(timer);
   }, [startListening]);
 
-  // Clean up all timers on unmount
+  // Clean up timers on unmount
   useEffect(() => {
     return () => {
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-      if (retryClearTimerRef.current) clearTimeout(retryClearTimerRef.current);
-      if (advanceTimerRef.current) clearTimeout(advanceTimerRef.current);
-      if (hintAutoDismissRef.current) clearTimeout(hintAutoDismissRef.current);
     };
   }, []);
 
-  // Skip verse handler (permanent backup button)
-  const handleSkipAyah = () => {
+  // Manual Next Button (backup)
+  const handleManualNext = () => {
     if (isAdvancingRef.current) return;
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    if (retryClearTimerRef.current) clearTimeout(retryClearTimerRef.current);
-
-    setIsFadingOut(true);
-    setTimeout(() => {
-      setLiveSpokenText('');
-      setVerseStatus('idle');
-      setSimilarity(0);
-      clearSession();
-
-      const nextIdx = currentAyahIndex + 1;
-      if (nextIdx >= totalAyahs) {
-        stopListening();
-        onFinishSurah();
-      } else {
-        setCurrentAyahIndex(nextIdx);
-        setIsFadingOut(false);
-      }
-    }, 250);
+    advanceToNextAyah(currentAyahIndex);
   };
 
+  // Toggle Microphone
   const toggleMic = () => {
     if (isListening) {
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
@@ -274,8 +148,9 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
     }
   };
 
+  // Back Button with confirmation
   const handleBackClicked = () => {
-    if (currentAyahIndex > 0) {
+    if (currentAyahIndex > 0 || liveSpokenText) {
       setShowExitConfirm(true);
     } else {
       stopListening();
@@ -288,26 +163,7 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
     onBackToIndex();
   };
 
-  const toggleHint = () => {
-    setShowHint((prev) => {
-      const next = !prev;
-      if (next) {
-        if (hintAutoDismissRef.current) clearTimeout(hintAutoDismissRef.current);
-        hintAutoDismissRef.current = setTimeout(() => {
-          setShowHint(false);
-        }, 5000);
-      }
-      return next;
-    });
-  };
-
-  // Dynamic font sizing (auto-fit based on verse length so no scrolling is ever needed)
-  const displayedContent =
-    verseStatus === 'success'
-      ? targetAyahText
-      : liveSpokenText || targetAyahText;
-  const contentLength = displayedContent.length;
-
+  // Auto-fit font size based on text length so single verse never overflows
   const getFontSizeClass = (len: number) => {
     if (len <= 45) return 'text-2xl sm:text-3xl md:text-4xl leading-relaxed sm:leading-loose';
     if (len <= 95) return 'text-xl sm:text-2xl md:text-3xl leading-relaxed sm:leading-loose';
@@ -362,10 +218,10 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
       </header>
 
       {/* 2.5 Diagnostic Status Bar (Temporary for debugging microphone status) */}
-      <div className="w-full bg-stone-900 text-stone-100 px-3 py-1 text-[11px] flex items-center justify-between z-20 shrink-0 border-b border-stone-800 font-arabic select-text">
-        <div className="flex items-center gap-1.5 truncate">
+      <div className="w-full bg-stone-900 text-stone-100 px-3 py-1.5 text-[11px] flex items-center justify-between z-20 shrink-0 border-b border-stone-800 font-arabic select-text leading-tight">
+        <div className="flex items-center gap-2 overflow-hidden mr-1">
           <span
-            className={`w-2 h-2 rounded-full shrink-0 ${
+            className={`w-2.5 h-2.5 rounded-full shrink-0 ${
               isListening
                 ? 'bg-emerald-400 animate-pulse'
                 : speechError
@@ -373,31 +229,40 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
                 : 'bg-amber-400'
             }`}
           />
-          <span className="font-bold text-emerald-400 shrink-0">تشخيص الميكروفون:</span>
-          <span className="truncate text-stone-300">
-            {debugStatus || (isListening ? 'بيسمع' : 'متوقف')}
+          <span className="font-bold text-emerald-400 shrink-0">تشخيص:</span>
+          <span className="truncate text-stone-200 font-mono text-[10px]" dir="ltr">
+            {debugStatus || (isListening ? 'يستمع' : 'متوقف')}
           </span>
         </div>
-        <span className="text-[10px] text-stone-400 shrink-0 mr-2 font-mono" dir="ltr">
+        <span className="text-[10px] text-stone-400 shrink-0 mr-1 font-mono" dir="ltr">
           {Capacitor.isNativePlatform() ? 'Android Native' : 'Web'}
         </span>
       </div>
 
-      {/* Notice Banners (Compact, non-intrusive) */}
-      {errorType === 'offline_language_missing' && (
-        <div className="mx-4 mt-2 p-2.5 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-stone-800 shrink-0 animate-in fade-in duration-200">
+      {/* Permission Denied Card */}
+      {errorType === 'permission_denied' && (
+        <div className="mx-4 mt-2 p-3 bg-red-50 border border-red-200 rounded-2xl text-xs text-red-900 shrink-0 animate-in fade-in duration-200">
           <div className="flex items-start gap-2">
-            <AlertCircle className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
-            <p className="text-[11px] text-stone-700 leading-snug">
-              <strong>وضع دون اتصال:</strong> لتفعيل التعرف أوفلاين، ثبّت حزمة العربية من
-              (إعدادات الهاتف ← Google ← التعرف الصوتي دون اتصال).
-            </p>
+            <AlertCircle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <p className="font-bold text-red-900 mb-1">تم رفض إذن الميكروفون</p>
+              <p className="text-[11px] text-red-700 leading-relaxed mb-2">
+                يرجى السماح للتطبيق باستخدام الميكروفون: إعدادات الهاتف ← التطبيقات ← تسميع القرآن ← الأذونات ← الميكروفون ← سماح.
+              </p>
+              <button
+                onClick={() => startListening()}
+                className="px-3.5 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold transition active:scale-95 shadow-sm"
+              >
+                إعادة طلب الإذن الآن
+              </button>
+            </div>
           </div>
         </div>
       )}
 
-      {speechError && errorType !== 'offline_language_missing' && (
-        <div className="mx-4 mt-2 p-2 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-center justify-between shrink-0 animate-in fade-in duration-200">
+      {/* General Error Banner */}
+      {speechError && errorType !== 'permission_denied' && (
+        <div className="mx-4 mt-2 p-2.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-center justify-between shrink-0 animate-in fade-in duration-200">
           <div className="flex items-center gap-1.5 truncate">
             <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
             <span className="truncate">{speechError}</span>
@@ -415,11 +280,11 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
       {!isSupported && (
         <div className="mx-4 mt-2 p-2 bg-red-50 border border-red-200 rounded-xl text-xs text-red-800 flex items-center gap-2 shrink-0">
           <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
-          <span>المتصفح لا يدعم التعرف على الصوت. يُفضل تطبيق أندرويد أو Chrome.</span>
+          <span>التعرف على الصوت غير متاح على هذا الجهاز.</span>
         </div>
       )}
 
-      {/* 3. Center Verse Area (Strictly NO SCROLL, auto-fit font size, single verse only) */}
+      {/* 3. Center Verse Area (Strictly NO SCROLL, auto-fit font size, pure live scribe) */}
       <main className="flex-1 w-full max-w-2xl mx-auto px-5 sm:px-8 flex flex-col items-center justify-center text-center overflow-hidden relative">
         {/* Basmalah for start of Surah (Ayah 1) */}
         {!isSurahTawbah && !isSurahFatihah && currentAyahIndex === 0 && (
@@ -434,70 +299,25 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
             isFadingOut ? 'opacity-0' : 'opacity-100'
           }`}
         >
-          {verseStatus === 'success' ? (
-            /* Verified Match (>= 80%): authentic Uthmani text with full tashkeel in emerald + checkmark */
-            <div className="w-full flex flex-col items-center justify-center animate-in fade-in duration-200">
-              <p
-                className={`font-quran font-bold text-emerald-800 leading-relaxed ${getFontSizeClass(
-                  contentLength
-                )}`}
-              >
-                {targetAyahText}{' '}
-                <span className="font-quran text-emerald-700 font-bold inline-block mr-1">
-                  ﴿{toArabicDigits(currentAyahIndex + 1)}﴾
-                </span>
-              </p>
-              <div className="flex items-center gap-1.5 mt-4 px-3.5 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold animate-in zoom-in-95 duration-200">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                <span>صحيح ✓</span>
-              </div>
-            </div>
-          ) : verseStatus === 'retry' ? (
-            /* Failed attempt (< 80%): soft red/gray with gentle retry notice */
-            <div className="w-full flex flex-col items-center justify-center animate-in fade-in duration-150">
-              <p
-                className={`font-quran font-bold text-red-700/80 line-through decoration-red-300 leading-relaxed ${getFontSizeClass(
-                  contentLength
-                )}`}
-              >
-                {liveSpokenText}{' '}
-                <span className="font-quran text-red-500 font-normal inline-block mr-1">
-                  ﴿{toArabicDigits(currentAyahIndex + 1)}﴾
-                </span>
-              </p>
-              <div className="flex items-center gap-2 mt-4 px-3.5 py-1.5 rounded-full bg-red-50 border border-red-200 text-red-700 text-xs font-medium">
-                <span>حاول مرة تانية... اقرأ الآية بوضوح</span>
-                {similarity > 0 && (
-                  <span className="text-[11px] text-stone-400">
-                    ({toArabicDigits(similarity)}٪)
-                  </span>
-                )}
-              </div>
-            </div>
-          ) : liveSpokenText ? (
-            /* Interim speech: live spoken words word-by-word with end verse symbol */
-            <div className="w-full flex flex-col items-center justify-center">
+          {liveSpokenText ? (
+            /* Live spoken text written as-is word-by-word with end verse symbol */
+            <div className="w-full flex flex-col items-center justify-center animate-in fade-in duration-100">
               <p
                 className={`font-quran font-bold text-stone-900 leading-relaxed ${getFontSizeClass(
-                  contentLength
+                  liveSpokenText.length
                 )}`}
               >
                 {liveSpokenText}
                 <span className="inline-block w-2 h-5 bg-emerald-600 rounded-full mr-1.5 animate-pulse align-middle" />{' '}
-                <span className="font-quran text-stone-400 font-normal inline-block mr-1">
+                <span className="font-quran text-stone-300 font-normal inline-block mr-1">
                   ﴿{toArabicDigits(currentAyahIndex + 1)}﴾
                 </span>
               </p>
-              {similarity > 0 && (
-                <span className="text-[11px] text-stone-400 font-medium mt-3">
-                  نسبة التطابق: {toArabicDigits(similarity)}٪
-                </span>
-              )}
             </div>
           ) : (
-            /* Empty / Waiting state: end symbol ﴿num﴾ in soft style waiting for recitation */
+            /* Empty / Waiting state: end symbol ﴿num﴾ waiting for recitation */
             <div className="w-full flex flex-col items-center justify-center py-2">
-              <div className="font-quran text-4xl sm:text-5xl text-stone-300 font-bold mb-4 select-none">
+              <div className="font-quran text-4xl sm:text-5xl text-stone-200 font-bold mb-4 select-none">
                 ﴿{toArabicDigits(currentAyahIndex + 1)}﴾
               </div>
               <p className="text-sm sm:text-base text-stone-400 font-arabic flex items-center justify-center gap-2">
@@ -514,34 +334,10 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
               </p>
             </div>
           )}
-
-          {/* Hint Card (available after 3 failed attempts) */}
-          {isHintAvailable && verseStatus !== 'success' && (
-            <div className="mt-5 flex flex-col items-center">
-              <button
-                onClick={toggleHint}
-                className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-800 text-xs font-bold border border-amber-200 transition"
-              >
-                <Lightbulb className="w-3.5 h-3.5 text-amber-600" />
-                <span>{showHint ? 'إخفاء التلميح' : 'تلميح (أول كلمتين)'}</span>
-              </button>
-
-              {showHint && hintText && (
-                <div className="mt-2 px-4 py-2 bg-amber-50/90 border border-amber-200 rounded-xl text-center animate-in fade-in duration-200">
-                  <span className="text-xs text-stone-500 font-medium ml-1">
-                    أول كلمتين:
-                  </span>
-                  <span className="font-quran text-base sm:text-lg text-amber-950 font-bold">
-                    « {hintText} ... »
-                  </span>
-                </div>
-              )}
-            </div>
-          )}
         </div>
       </main>
 
-      {/* 4. Fixed Bottom Controls (Microphone + Skip Button) */}
+      {/* 4. Fixed Bottom Controls (Microphone + Manual Next Button) */}
       <footer className="w-full shrink-0 bg-white/95 backdrop-blur-md border-t border-stone-100 px-6 pt-3 pb-[max(env(safe-area-inset-bottom),18px)] flex flex-col items-center">
         <div className="w-full max-w-sm flex items-center justify-between">
           {/* Listening Status Badge */}
@@ -549,43 +345,46 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
             {isListening ? (
               <span className="text-emerald-700 flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-emerald-600 animate-ping" />
-                <span>جاري الاستماع</span>
+                <span>يستمع</span>
               </span>
             ) : (
               <span className="text-stone-400">متوقف</span>
             )}
           </div>
 
-          {/* Large Central Microphone Button */}
+          {/* Large Central Microphone Button with Pulsing Animation */}
           <div className="relative flex flex-col items-center">
             {isListening && (
-              <span className="absolute -inset-2.5 rounded-full bg-emerald-500/20 animate-ping pointer-events-none" />
+              <>
+                <span className="absolute -inset-3 rounded-full bg-emerald-500/25 animate-ping pointer-events-none" />
+                <span className="absolute -inset-1.5 rounded-full bg-emerald-500/40 animate-pulse pointer-events-none" />
+              </>
             )}
             <button
               onClick={toggleMic}
               className={`relative z-10 w-16 h-16 sm:w-18 sm:h-18 rounded-full flex items-center justify-center shadow-lg transition-all active:scale-95 ${
                 isListening
-                  ? 'bg-emerald-600 text-white ring-4 ring-emerald-500/30 shadow-emerald-600/30'
+                  ? 'bg-emerald-600 text-white ring-4 ring-emerald-400/50 shadow-emerald-600/40 scale-105 animate-pulse'
                   : 'bg-stone-900 text-white hover:bg-stone-800 shadow-stone-900/20'
               }`}
               title={isListening ? 'إيقاف الاستماع' : 'بدء الاستماع والتسميع'}
             >
               {isListening ? (
-                <Mic className="w-8 h-8 animate-pulse" />
+                <Mic className="w-8 h-8 animate-pulse text-white" />
               ) : (
-                <MicOff className="w-7 h-7 opacity-85" />
+                <MicOff className="w-7 h-7 opacity-85 text-stone-200" />
               )}
             </button>
           </div>
 
-          {/* Skip Button (Permanent backup) */}
+          {/* Manual Next Button (Backup) */}
           <div className="w-24 flex items-center justify-end">
             <button
-              onClick={handleSkipAyah}
+              onClick={handleManualNext}
               className="flex items-center gap-1 px-3 py-2 rounded-xl border border-stone-200 text-stone-700 hover:bg-stone-50 hover:text-stone-900 text-xs font-semibold transition active:scale-95 shadow-sm"
-              title="تخطي هذه الآية والانتقال للآية التالية"
+              title="الانتقال للآية التالية يدوياً"
             >
-              <span>تخطي</span>
+              <span>التالية</span>
               <SkipForward className="w-3.5 h-3.5 rotate-180 text-stone-500" />
             </button>
           </div>
@@ -594,7 +393,7 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
         {/* Helper Note */}
         <p className="mt-2 text-[11px] text-stone-400 font-arabic select-none text-center">
           {isListening
-            ? 'اقرأ الآية بنسبة ٧٠٪ أو أكثر لتثبيتها والانتقال تلقائياً'
+            ? 'التسميع مستمر تلقائياً • الانتقال للآية التالية بعد ثانيتين من السكوت'
             : 'اضغط على الميكروفون للبدء'}
         </p>
       </footer>
