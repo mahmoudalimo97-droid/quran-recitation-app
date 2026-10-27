@@ -18,31 +18,21 @@ export function useSpeechRecognition({
   onTranscript,
   lang = 'ar-SA',
 }: SpeechRecognitionHookOptions = {}) {
+  const isNative = Capacitor.isNativePlatform();
+
   const [isListening, setIsListening] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [errorType, setErrorType] = useState<SpeechErrorType>(null);
   const [isSupported, setIsSupported] = useState(true);
   const [audioLevel, setAudioLevel] = useState(0);
+  const [debugStatus, setDebugStatus] = useState<string>('جاري التهيئة...');
 
-  // Web Speech API refs
-  const recognitionRef = useRef<any>(null);
+  // State refs to prevent stale closures
   const shouldListenRef = useRef(false);
-  const resultOffsetRef = useRef<number>(0);
-  const latestResultCountRef = useRef<number>(0);
-
-  // Native plugin refs
-  const isNative = Capacitor.isNativePlatform();
+  const recognitionRef = useRef<any>(null);
   const listenersAttachedRef = useRef(false);
-  const baseUtteranceRef = useRef<string>('');
-  const lastSeenUtteranceRef = useRef<string>('');
-  const simulatedLevelIntervalRef = useRef<number | null>(null);
-
-  // Audio visualizer refs
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const animFrameRef = useRef<number | null>(null);
+  const restartTimerRef = useRef<any>(null);
 
   // Fresh callback reference
   const onTranscriptRef = useRef(onTranscript);
@@ -50,25 +40,41 @@ export function useSpeechRecognition({
     onTranscriptRef.current = onTranscript;
   }, [onTranscript]);
 
-  // Check support on mount
+  // Audio level visualizer refs
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+  const simulatedLevelIntervalRef = useRef<number | null>(null);
+
+  // Check hardware/plugin support on mount
   useEffect(() => {
-    if (Capacitor.isNativePlatform()) {
+    if (isNative) {
       NativeSpeechRecognition.available()
         .then((res) => {
           setIsSupported(res.available);
+          if (!res.available) {
+            setDebugStatus('خدمة التعرف غير متوفرة على هذا الجهاز');
+          } else {
+            setDebugStatus('جاهز (أندرويد)');
+          }
         })
-        .catch(() => {
-          // Assume supported on native Android by default
+        .catch((err) => {
+          console.warn('Native check available failed:', err);
           setIsSupported(true);
+          setDebugStatus('جاهز (أندرويد)');
         });
     } else {
       const WebSpeech =
         (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       if (!WebSpeech) {
         setIsSupported(false);
+        setDebugStatus('المتصفح لا يدعم التعرف الصوتي');
+      } else {
+        setDebugStatus('جاهز (ويب)');
       }
     }
-  }, []);
+  }, [isNative]);
 
   const stopAudioVisualizer = useCallback(() => {
     if (animFrameRef.current) {
@@ -95,7 +101,6 @@ export function useSpeechRecognition({
   const startAudioVisualizer = useCallback(async () => {
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        // Fallback pulsing visualizer for native platforms if Web Audio is restricted
         if (isNative) {
           if (simulatedLevelIntervalRef.current) clearInterval(simulatedLevelIntervalRef.current);
           simulatedLevelIntervalRef.current = window.setInterval(() => {
@@ -132,13 +137,11 @@ export function useSpeechRecognition({
         }
         const avg = sum / dataArray.length;
         setAudioLevel(Math.min(100, Math.round((avg / 128) * 100)));
-
         animFrameRef.current = requestAnimationFrame(updateLevel);
       };
 
       updateLevel();
-    } catch (e) {
-      console.warn('Audio visualizer fallback to simulated level:', e);
+    } catch (_) {
       if (simulatedLevelIntervalRef.current) clearInterval(simulatedLevelIntervalRef.current);
       simulatedLevelIntervalRef.current = window.setInterval(() => {
         setAudioLevel(Math.floor(20 + Math.random() * 40));
@@ -146,109 +149,100 @@ export function useSpeechRecognition({
     }
   }, [isNative]);
 
-  // Clean up on unmount
-  useEffect(() => {
-    return () => {
-      shouldListenRef.current = false;
-      if (isNative) {
-        NativeSpeechRecognition.stop().catch(() => {});
-        NativeSpeechRecognition.removeAllListeners().catch(() => {});
-      } else if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch (_) {}
+  // Restart function for Native Android
+  const scheduleNativeRestart = useCallback(() => {
+    if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+    if (!shouldListenRef.current) return;
+
+    restartTimerRef.current = setTimeout(async () => {
+      if (!shouldListenRef.current) return;
+      try {
+        await NativeSpeechRecognition.start({
+          language: lang,
+          partialResults: true,
+          popup: false,
+        });
+        setIsListening(true);
+        setDebugStatus('بيسمع (أندرويد)');
+        setError(null);
+      } catch (err: any) {
+        console.warn('Native auto-restart failed:', err);
+        const msg = String(err?.message || err);
+        setDebugStatus(`وقف: ${msg}`);
+        // If it was already running or busy, we wait and retry
+        if (shouldListenRef.current) {
+          restartTimerRef.current = setTimeout(() => {
+            if (shouldListenRef.current) scheduleNativeRestart();
+          }, 700);
+        }
       }
-      stopAudioVisualizer();
-    };
-  }, [isNative, stopAudioVisualizer]);
+    }, 250);
+  }, [lang]);
 
   // Start Native Listening using @capacitor-community/speech-recognition
   const startNativeListening = useCallback(async () => {
     setError(null);
-    try {
-      // 1. Check & Request Permissions
-      const permStatus = await NativeSpeechRecognition.checkPermissions();
-      if (permStatus.speechRecognition !== 'granted') {
-        const reqResult = await NativeSpeechRecognition.requestPermissions();
-        if (reqResult.speechRecognition !== 'granted') {
-          setErrorType('permission_denied');
-          setError('لم يتم منح إذن الميكروفون. يرجى السماح للتطبيق بالوصول إلى الميكروفون من إعدادات الهاتف لتتمكن من التسميع.');
-          setIsListening(false);
-          shouldListenRef.current = false;
-          return;
-        }
-      }
+    setErrorType(null);
+    setDebugStatus('جاري فحص الإذن والخدمة...');
 
-      // 2. Check Service Availability
+    try {
+      // 1. Verify availability
       const avail = await NativeSpeechRecognition.available();
       if (!avail.available) {
         setErrorType('unsupported');
-        setError('خدمة التعرف الصوتي غير متوفرة على هذا الجهاز. يرجى التحقق من تفعيل خدمات Google.');
+        setError('خدمة التعرف الصوتي غير متوفرة على هذا الجهاز. يرجى تفعيل تطبيق Google.');
+        setDebugStatus('خطأ: خدمة التعرف غير متوفرة (Google Speech)');
+        setIsListening(false);
+        shouldListenRef.current = false;
+        return;
+      }
+
+      // 2. Request permissions explicitly at runtime
+      const permResult = await NativeSpeechRecognition.requestPermissions();
+      if (permResult.speechRecognition !== 'granted') {
+        setErrorType('permission_denied');
+        setError('لم يتم منح إذن الميكروفون. يرجى السماح للتطبيق بالوصول إلى الميكروفون من إعدادات الهاتف لتتمكن من التسميع.');
+        setDebugStatus('خطأ: تم رفض إذن الميكروفون');
         setIsListening(false);
         shouldListenRef.current = false;
         return;
       }
 
       shouldListenRef.current = true;
-      baseUtteranceRef.current = '';
-      lastSeenUtteranceRef.current = '';
 
-      // 3. Register Event Listeners if not already attached
+      // 3. Register Event Listeners once
       if (!listenersAttachedRef.current) {
         await NativeSpeechRecognition.removeAllListeners();
 
+        // Listen for partial results as user speaks
         await NativeSpeechRecognition.addListener('partialResults', (data: { matches: string[] }) => {
           if (!shouldListenRef.current) return;
           const matches = data.matches || [];
-          const bestMatch = matches[0] || '';
-          if (!bestMatch) return;
+          const text = matches[0] || '';
+          if (!text) return;
 
-          lastSeenUtteranceRef.current = bestMatch;
+          setInterimTranscript(text);
+          setDebugStatus(`بيسمع: "${text.length > 25 ? '...' + text.slice(-25) : text}"`);
 
-          // Strip baseline if clearSession occurred within same recognition burst
-          let effectiveText = bestMatch;
-          if (baseUtteranceRef.current && effectiveText.startsWith(baseUtteranceRef.current)) {
-            effectiveText = effectiveText.slice(baseUtteranceRef.current.length).trim();
-          }
-
-          setInterimTranscript(effectiveText);
-          if (effectiveText && onTranscriptRef.current) {
-            onTranscriptRef.current(effectiveText, false);
+          if (onTranscriptRef.current) {
+            onTranscriptRef.current(text, false);
           }
         });
 
+        // Listen for state changes (auto restart on premature end)
         await NativeSpeechRecognition.addListener('listeningState', (data: { status: 'started' | 'stopped' }) => {
           if (data.status === 'started') {
             setIsListening(true);
+            setDebugStatus('بيسمع (أندرويد)');
             setError(null);
             setErrorType(null);
           } else if (data.status === 'stopped') {
-            // Auto restart if listening was not manually stopped
             if (shouldListenRef.current) {
-              setTimeout(async () => {
-                if (shouldListenRef.current) {
-                  try {
-                    baseUtteranceRef.current = '';
-                    lastSeenUtteranceRef.current = '';
-                    await NativeSpeechRecognition.start({
-                      language: lang,
-                      maxResults: 3,
-                      prompt: 'اقرأ الآن',
-                      partialResults: true,
-                      popup: false,
-                    });
-                  } catch (err: any) {
-                    console.warn('Native auto-restart notice:', err);
-                    const msg = String(err?.message || err).toLowerCase();
-                    if (msg.includes('network') || msg.includes('server') || msg.includes('offline')) {
-                      setErrorType('offline_language_missing');
-                      setError('حزمة اللغة العربية للتعرف دون اتصال غير مثبتة على الهاتف.');
-                    }
-                  }
-                }
-              }, 200);
+              setDebugStatus('وقف مؤقتاً - جاري إعادة التشغيل...');
+              scheduleNativeRestart();
             } else {
               setIsListening(false);
+              setDebugStatus('متوقف');
               stopAudioVisualizer();
             }
           }
@@ -257,42 +251,47 @@ export function useSpeechRecognition({
         listenersAttachedRef.current = true;
       }
 
-      // 4. Start Recognition
+      // 4. Start Recognition with exact parameters
+      setDebugStatus('بدء الميكروفون...');
       await NativeSpeechRecognition.start({
         language: lang,
-        maxResults: 3,
-        prompt: 'اقرأ الآن',
         partialResults: true,
         popup: false,
       });
 
       setIsListening(true);
-      setError(null);
-      setErrorType(null);
+      setDebugStatus('بيسمع (أندرويد)');
       startAudioVisualizer();
     } catch (err: any) {
-      console.warn('Native speech recognition notice:', err);
-      const msg = String(err?.message || err).toLowerCase();
-      if (msg.includes('network') || msg.includes('server') || msg.includes('offline')) {
+      console.warn('Native speech start error:', err);
+      const msg = String(err?.message || err);
+      const msgLower = msg.toLowerCase();
+
+      if (msgLower.includes('network') || msgLower.includes('offline') || msgLower.includes('server')) {
         setErrorType('offline_language_missing');
         setError('حزمة اللغة العربية للتعرف دون اتصال غير مثبتة على الهاتف.');
-      } else if (msg.includes('permission') || msg.includes('denied')) {
+        setDebugStatus('خطأ: حزمة التعرف الصوتي دون اتصال غير مثبتة');
+      } else if (msgLower.includes('permission') || msgLower.includes('denied')) {
         setErrorType('permission_denied');
         setError('لم يتم منح إذن الميكروفون.');
+        setDebugStatus('خطأ: تم رفض إذن الميكروفون');
       } else {
         setErrorType('generic');
-        setError('حدث خطأ أثناء تشغيل الميكروفون. يمكنك الضغط على الميكروفون لإعادة المحاولة أو تخطي الآية.');
+        setError(`حدث خطأ أثناء تشغيل الميكروفون: ${msg}`);
+        setDebugStatus(`خطأ: ${msg}`);
       }
       setIsListening(false);
       shouldListenRef.current = false;
       stopAudioVisualizer();
     }
-  }, [lang, startAudioVisualizer, stopAudioVisualizer]);
+  }, [lang, scheduleNativeRestart, startAudioVisualizer, stopAudioVisualizer]);
 
-  // Start Web Listening using Web Speech API
+  // Start Web Listening using standard Web Speech API
   const startWebListening = useCallback(() => {
     setError(null);
     setErrorType(null);
+    setDebugStatus('جاري تشغيل ميكروفون المتصفح...');
+
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
@@ -300,12 +299,11 @@ export function useSpeechRecognition({
       setIsSupported(false);
       setErrorType('unsupported');
       setError('المتصفح الحالي لا يدعم التعرف على الصوت.');
+      setDebugStatus('خطأ: المتصفح لا يدعم Web Speech API');
       return;
     }
 
     shouldListenRef.current = true;
-    resultOffsetRef.current = 0;
-    latestResultCountRef.current = 0;
 
     try {
       if (recognitionRef.current) {
@@ -320,85 +318,62 @@ export function useSpeechRecognition({
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.lang = lang;
-      recognition.maxAlternatives = 3;
+      recognition.maxAlternatives = 1;
 
       recognition.onstart = () => {
         setIsListening(true);
         setError(null);
         setErrorType(null);
-        resultOffsetRef.current = 0;
-        latestResultCountRef.current = 0;
+        setDebugStatus('بيسمع (ويب)');
         startAudioVisualizer();
       };
 
       recognition.onresult = (event: any) => {
         if (!event.results) return;
-        latestResultCountRef.current = event.results.length;
-
-        let interimStr = '';
-        let finalStr = '';
-
-        const startIdx = Math.max(resultOffsetRef.current, 0);
-
-        for (let i = startIdx; i < event.results.length; ++i) {
-          const item = event.results[i];
-          const transcriptChunk = item[0]?.transcript || '';
-
-          if (item.isFinal) {
-            finalStr += transcriptChunk + ' ';
-          } else {
-            interimStr += transcriptChunk + ' ';
-          }
+        let transcript = '';
+        for (let i = 0; i < event.results.length; ++i) {
+          transcript += event.results[i][0]?.transcript || '';
         }
-
-        const fullChunk = (finalStr + interimStr).trim();
-        setInterimTranscript(fullChunk);
-
-        if (fullChunk && onTranscriptRef.current) {
-          const isFinal = Boolean(finalStr.trim() && !interimStr.trim());
-          onTranscriptRef.current(fullChunk, isFinal);
+        transcript = transcript.trim();
+        if (transcript) {
+          setInterimTranscript(transcript);
+          setDebugStatus(`بيسمع: "${transcript.length > 25 ? '...' + transcript.slice(-25) : transcript}"`);
+          if (onTranscriptRef.current) {
+            onTranscriptRef.current(transcript, false);
+          }
         }
       };
 
       recognition.onerror = (event: any) => {
-        console.warn('Speech recognition error event:', event.error);
+        console.warn('Web speech error:', event.error);
         if (event.error === 'no-speech') {
           return;
         }
+        setDebugStatus(`خطأ: ${event.error}`);
         if (event.error === 'not-allowed') {
           setErrorType('permission_denied');
-          setError('لم يتم منح إذن الميكروفون. يرجى السماح بالوصول للميكروفون من إعدادات المتصفح.');
+          setError('لم يتم منح إذن الميكروفون في المتصفح.');
           shouldListenRef.current = false;
           setIsListening(false);
           stopAudioVisualizer();
-          return;
-        }
-        if (event.error === 'network') {
-          setErrorType('offline_language_missing');
-          setError('التعرف على الصوت يحتاج حزمة اللغة العربية دون اتصال.');
+        } else {
+          setError(`خطأ الميكروفون: ${event.error}`);
         }
       };
 
       recognition.onend = () => {
-        resultOffsetRef.current = 0;
-        latestResultCountRef.current = 0;
-
         if (shouldListenRef.current) {
-          try {
-            recognition.start();
-          } catch (_) {
-            setTimeout(() => {
-              if (shouldListenRef.current) {
-                try {
-                  recognition.start();
-                } catch (e) {
-                  console.warn('Recognition restart error:', e);
-                }
-              }
-            }, 250);
-          }
+          setDebugStatus('وقف مؤقتاً - إعادة تشغيل (ويب)...');
+          setTimeout(() => {
+            if (shouldListenRef.current) {
+              try {
+                recognition.start();
+              } catch (_) {}
+            }
+          }, 200);
         } else {
           setIsListening(false);
+          setDebugStatus('متوقف');
           stopAudioVisualizer();
         }
       };
@@ -406,7 +381,9 @@ export function useSpeechRecognition({
       recognition.start();
     } catch (err: any) {
       console.error('Failed to start web speech recognition:', err);
-      setError('تعذر تشغيل التعرف على الصوت. تحقق من توصيل الميكروفون.');
+      const msg = String(err?.message || err);
+      setError('تعذر تشغيل التعرف على الصوت.');
+      setDebugStatus(`خطأ: ${msg}`);
       setIsListening(false);
       stopAudioVisualizer();
     }
@@ -414,48 +391,77 @@ export function useSpeechRecognition({
 
   // Unified startListening entry point
   const startListening = useCallback(() => {
-    if (Capacitor.isNativePlatform()) {
+    if (isNative) {
       startNativeListening();
     } else {
       startWebListening();
     }
-  }, [startNativeListening, startWebListening]);
+  }, [isNative, startNativeListening, startWebListening]);
 
   // Unified stopListening
   const stopListening = useCallback(() => {
     shouldListenRef.current = false;
+    if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
     setIsListening(false);
     setInterimTranscript('');
+    setDebugStatus('متوقف');
     stopAudioVisualizer();
 
-    if (Capacitor.isNativePlatform()) {
-      baseUtteranceRef.current = '';
-      lastSeenUtteranceRef.current = '';
+    if (isNative) {
       NativeSpeechRecognition.stop().catch(() => {});
-    } else {
-      resultOffsetRef.current = 0;
-      latestResultCountRef.current = 0;
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch (_) {}
-      }
+    } else if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (_) {}
     }
-  }, [stopAudioVisualizer]);
+  }, [isNative, stopAudioVisualizer]);
+
+  // Clears the current transcript and restarts recognizer for next ayah
+  const clearSession = useCallback(() => {
+    setInterimTranscript('');
+    if (isNative && shouldListenRef.current) {
+      NativeSpeechRecognition.stop()
+        .then(() => {
+          if (shouldListenRef.current) {
+            setTimeout(() => {
+              if (shouldListenRef.current) {
+                NativeSpeechRecognition.start({
+                  language: lang,
+                  partialResults: true,
+                  popup: false,
+                }).catch(() => {});
+              }
+            }, 100);
+          }
+        })
+        .catch(() => {});
+    } else if (!isNative && recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch (_) {}
+    }
+  }, [isNative, lang]);
 
   const resetTranscript = useCallback(() => {
     setInterimTranscript('');
   }, []);
 
-  // Seamlessly transitions between Ayahs without resetting audio hardware
-  const clearSession = useCallback(() => {
-    setInterimTranscript('');
-    if (Capacitor.isNativePlatform()) {
-      baseUtteranceRef.current = lastSeenUtteranceRef.current;
-    } else {
-      resultOffsetRef.current = latestResultCountRef.current;
-    }
-  }, []);
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      shouldListenRef.current = false;
+      if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+      if (isNative) {
+        NativeSpeechRecognition.stop().catch(() => {});
+        NativeSpeechRecognition.removeAllListeners().catch(() => {});
+      } else if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch (_) {}
+      }
+      stopAudioVisualizer();
+    };
+  }, [isNative, stopAudioVisualizer]);
 
   return {
     isListening,
@@ -464,6 +470,7 @@ export function useSpeechRecognition({
     error,
     errorType,
     isSupported,
+    debugStatus,
     startListening,
     stopListening,
     resetTranscript,

@@ -10,6 +10,7 @@ import {
   Lightbulb,
 } from 'lucide-react';
 import { QuranSurahData } from '../types/quran';
+import { Capacitor } from '@capacitor/core';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import {
   calculateAyahMatch,
@@ -213,6 +214,7 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
     error: speechError,
     errorType,
     isSupported,
+    debugStatus,
     startListening,
     stopListening,
     clearSession,
@@ -358,6 +360,28 @@ export const RecitationScreen: React.FC<RecitationScreenProps> = ({
           {toArabicDigits(currentAyahIndex)} / {toArabicDigits(totalAyahs)}
         </div>
       </header>
+
+      {/* 2.5 Diagnostic Status Bar (Temporary for debugging microphone status) */}
+      <div className="w-full bg-stone-900 text-stone-100 px-3 py-1 text-[11px] flex items-center justify-between z-20 shrink-0 border-b border-stone-800 font-arabic select-text">
+        <div className="flex items-center gap-1.5 truncate">
+          <span
+            className={`w-2 h-2 rounded-full shrink-0 ${
+              isListening
+                ? 'bg-emerald-400 animate-pulse'
+                : speechError
+                ? 'bg-red-400'
+                : 'bg-amber-400'
+            }`}
+          />
+          <span className="font-bold text-emerald-400 shrink-0">تشخيص الميكروفون:</span>
+          <span className="truncate text-stone-300">
+            {debugStatus || (isListening ? 'بيسمع' : 'متوقف')}
+          </span>
+        </div>
+        <span className="text-[10px] text-stone-400 shrink-0 mr-2 font-mono" dir="ltr">
+          {Capacitor.isNativePlatform() ? 'Android Native' : 'Web'}
+        </span>
+      </div>
 
       {/* Notice Banners (Compact, non-intrusive) */}
       {errorType === 'offline_language_missing' && (
